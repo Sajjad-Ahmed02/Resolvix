@@ -25,7 +25,11 @@ from sqlalchemy import delete, func, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.security import hash_password, verify_password
+from app.core.security import (
+    hash_password,
+    is_argon2_hash,
+    verify_password,
+)
 from app.db.session import SessionLocal
 from app.models import (
     EMBEDDING_DIMENSION,
@@ -259,8 +263,9 @@ def check_seed_data(session: Session) -> None:
 
     admin = session.scalar(select(User).where(User.role == "admin"))
     assert admin is not None
+    assert is_argon2_hash(admin.password_hash)
     assert verify_password("Admin123!", admin.password_hash)
-    ok("admin password is stored as a verifiable PBKDF2 hash, never plaintext")
+    ok("admin password is stored as a verifiable Argon2id hash, never plaintext")
 
     orders_without_items = session.scalar(
         select(func.count())

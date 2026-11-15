@@ -5,7 +5,8 @@ Run from the backend directory:
     python -m scripts.seed
 
 The script is idempotent: rows are matched by their natural keys and existing
-rows are left untouched. It never uses real customer data.
+rows are left untouched. Unchanged demo passwords are upgraded from the Phase 1
+PBKDF2 format to Argon2id. It never uses real customer data.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import hash_password
+from app.core.security import hash_password, is_argon2_hash, verify_password
 from app.db.session import SessionLocal
 from app.models import FAQ, KnowledgeDocument, Order, OrderItem, User
 
@@ -303,6 +304,25 @@ def seed_users(session: Session) -> tuple[int, int]:
     return created, skipped
 
 
+def upgrade_demo_password_hashes(session: Session) -> int:
+    """Upgrade unchanged demo passwords from Phase 1 PBKDF2 to Argon2id.
+
+    Only hashes that still verify against the documented demo password are
+    touched, so a manually changed development password is preserved.
+    """
+    upgraded = 0
+    for _, email, _, password in USERS:
+        user = session.scalar(select(User).where(User.email == email))
+        if user is None or is_argon2_hash(user.password_hash):
+            continue
+        if verify_password(password, user.password_hash):
+            user.password_hash = hash_password(password)
+            upgraded += 1
+
+    session.flush()
+    return upgraded
+
+
 def seed_orders(session: Session) -> tuple[int, int]:
     existing = set(session.scalars(select(Order.order_number)).all())
     users = {
@@ -413,6 +433,7 @@ def seed_documents(session: Session) -> tuple[int, int]:
 def main() -> None:
     with SessionLocal() as session:
         users_created, users_skipped = seed_users(session)
+        hashes_upgraded = upgrade_demo_password_hashes(session)
         orders_created, orders_skipped = seed_orders(session)
         faqs_created, faqs_skipped = seed_faqs(session)
         documents_created, documents_skipped = seed_documents(session)
@@ -421,6 +442,9 @@ def main() -> None:
         print("Seed complete.")
         print(
             f"  users:       {users_created} created, {users_skipped} already present"
+        )
+        print(
+            f"  passwords:   {hashes_upgraded} legacy hash(es) upgraded to Argon2id"
         )
         print(
             f"  orders:      {orders_created} created, {orders_skipped} already present"
