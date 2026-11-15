@@ -34,8 +34,8 @@ secrets, or provider API keys.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `DATABASE_URL` | yes | — | SQLAlchemy PostgreSQL URL (`postgresql+psycopg://...`) |
-| `JWT_SECRET_KEY` | yes | — | HMAC signing key, at least 32 characters |
+| `DATABASE_URL` | yes | none | SQLAlchemy PostgreSQL URL (`postgresql+psycopg://...`) |
+| `JWT_SECRET_KEY` | yes | none | HMAC signing key, at least 32 characters |
 | `JWT_ALGORITHM` | no | `HS256` | Allowed values: `HS256`, `HS384`, `HS512` |
 | `JWT_ISSUER` | no | `resolvix` | Validated `iss` claim |
 | `JWT_AUDIENCE` | no | `resolvix-api` | Validated `aud` claim |
@@ -135,8 +135,10 @@ Security properties:
 | GET | `/auth/me` | bearer | Return the authenticated user and role |
 | POST | `/auth/logout` | bearer | Acknowledge stateless logout (`204`) |
 | GET | `/conversations` | bearer | List only the caller's conversations |
+| POST | `/conversations` | bearer | Create a conversation for the caller (`201`) |
 | GET | `/conversations/{id}` | bearer | Read an owned conversation and messages |
 | GET | `/conversations/{id}/messages` | bearer | Read messages in an owned conversation |
+| POST | `/conversations/{id}/messages` | bearer | Save a customer message and temporary assistant reply (`201`) |
 | GET | `/orders` | bearer | List only the caller's orders |
 | GET | `/orders/{order_number}` | bearer | Read an owned order (`404` for another customer) |
 | GET | `/admin/users` | admin | List all users (no password hashes) |
@@ -146,6 +148,13 @@ Security properties:
 
 Customers receive `403` on admin endpoints. Another customer's order or
 conversation returns `404`, which avoids revealing that the record exists.
+
+Conversation creation takes its owner from the bearer token. Sending a message
+trims and validates the content, stores the customer message, stores a
+temporary assistant reply, sets the first message as the conversation title,
+and advances the conversation timestamp. The placeholder reply is marked with
+`metadata.temporary = true` so it is easy to replace when an AI provider is
+connected.
 
 ## Tests
 
@@ -162,6 +171,9 @@ conversations, and orders, and deletes them afterwards. It covers:
 - missing/invalid tokens on protected endpoints;
 - customer/admin authorization, forged role claims, and live role changes;
 - cross-customer order and conversation isolation;
+- conversation creation, message persistence, auto-titles, timestamp updates,
+  chronological reload, and the temporary assistant reply;
+- message validation and 404s for another customer's conversation;
 - database health failures and sanitized internal errors;
 - Swagger/OpenAPI documentation and the bearer security scheme.
 

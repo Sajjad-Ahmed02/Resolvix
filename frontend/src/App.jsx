@@ -1,16 +1,27 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
+import ProtectedRoute from "./components/ProtectedRoute";
+import AuthProvider from "./context/AuthProvider";
 import MainLayout from "./layouts/MainLayout";
-import Home from "./pages/Home";
+import Chat from "./pages/Chat";
+import Login from "./pages/Login";
 
 function App() {
   return (
     <BrowserRouter>
-      <Routes>
-        <Route element={<MainLayout />}>
-          <Route path="/" element={<Home />} />
-        </Route>
-      </Routes>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+
+          <Route element={<ProtectedRoute />}>
+            <Route element={<MainLayout />}>
+              <Route index element={<Chat />} />
+            </Route>
+          </Route>
+
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

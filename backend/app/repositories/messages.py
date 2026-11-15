@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +31,7 @@ def create(
     role: str,
     content: str,
     metadata: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
 ) -> Message:
     """Persist a message. Callers must have verified conversation ownership."""
     message = Message(
@@ -38,6 +40,8 @@ def create(
         content=content,
         message_metadata=metadata,
     )
+    if created_at is not None:
+        message.created_at = created_at
     session.add(message)
     session.flush()
     return message
