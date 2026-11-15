@@ -1,8 +1,8 @@
-# Resolvix Phase 1 Database Design
+# Resolvix Database Design
 
-Status: implemented and verified  
-Database: PostgreSQL 18 with pgvector 0.8.7  
-Embedding model: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions)
+- Status: implemented and verified
+- Database: PostgreSQL 18 with pgvector 0.8.7
+- Embedding model: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions)
 
 ## Architecture
 
@@ -42,7 +42,7 @@ erDiagram
         uuid id PK
         varchar name "max 100, not blank"
         varchar email UK "max 255, lowercase"
-        text password_hash "PBKDF2 hash, never plaintext"
+        text password_hash "Argon2id hash, never plaintext"
         varchar role "customer or admin"
         timestamptz created_at
         timestamptz updated_at
@@ -150,8 +150,9 @@ deleting through the ORM and deleting through raw SQL behave consistently.
 - `id` UUID primary key, default `gen_random_uuid()`.
 - `name` `VARCHAR(100) NOT NULL`, check that it is not blank.
 - `email` `VARCHAR(255) NOT NULL UNIQUE`, check that it is lowercase.
-- `password_hash` `TEXT NOT NULL`; only PBKDF2 hashes are written by the seed
-  and security helpers.
+- `password_hash` `TEXT NOT NULL`; new hashes use Argon2id. Legacy Phase 1
+  PBKDF2 hashes remain verifiable and are upgraded on the next successful
+  login or seed run.
 - `role` `VARCHAR(20) NOT NULL DEFAULT 'customer'`, check in
   (`customer`, `admin`).
 - `created_at`, `updated_at` `TIMESTAMPTZ NOT NULL DEFAULT NOW()`.
