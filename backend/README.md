@@ -42,8 +42,50 @@ secrets, or provider API keys.
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | no | `30` | Access-token lifetime |
 | `DB_CONNECT_TIMEOUT` | no | `5` | PostgreSQL connect timeout in seconds |
 | `CORS_ORIGINS` | no | Vite localhost origins | JSON list of allowed frontend origins |
+| `LLM_PROVIDER` | no | `gemini` | `gemini` (hosted) or `ollama` (local) |
+| `LLM_MODEL` | no | `gemini-3.5-flash-lite` | Gemini model identifier |
+| `GEMINI_API_KEY` | for Gemini | none | Gemini API key from Google AI Studio |
+| `OLLAMA_BASE_URL` | for Ollama | `http://localhost:11434` | Local Ollama server |
+| `OLLAMA_MODEL` | for Ollama | `llama3.2:3b` | Model already pulled locally |
+| `LLM_TIMEOUT` | no | `60` | Provider request timeout in seconds |
+| `LLM_TEMPERATURE` | no | `0.7` | Sampling temperature |
+| `LLM_MAX_TOKENS` | no | `2048` | Maximum generated tokens |
 
 Application settings live in `app/core/config.py`.
+
+## LLM providers
+
+The chat service depends on one async provider interface; vendor code stays in
+`app/ai/providers/`. Select the active provider with `LLM_PROVIDER`:
+
+```env
+# Hosted Gemini
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.5-flash-lite
+GEMINI_API_KEY=your-key-here
+```
+
+```env
+# Local Ollama (no API key)
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:3b
+```
+
+Gemini keys are created at <https://aistudio.google.com/apikey>. Ollama is
+installed from <https://ollama.com/download>; pull the selected model once with
+`ollama pull llama3.2:3b`.
+
+`GEMINI_API_KEY` takes precedence over `LLM_API_KEY`. Keys and private
+endpoints belong in `backend/.env` only. `.env.example` contains placeholders and
+is the only environment file committed.
+
+Provider selection is evaluated per request. Gemini uses the official
+`google-genai` SDK, while Ollama uses its native `/api/chat` HTTP endpoint.
+Timeouts, rate limits, missing models, connection failures, and malformed
+responses are converted into one of the normalized errors in
+`app/ai/providers/base.py`. The chat service logs the failure and persists a
+controlled fallback assistant reply instead of exposing vendor details.
 
 ## Database
 
@@ -138,7 +180,7 @@ Security properties:
 | POST | `/conversations` | bearer | Create a conversation for the caller (`201`) |
 | GET | `/conversations/{id}` | bearer | Read an owned conversation and messages |
 | GET | `/conversations/{id}/messages` | bearer | Read messages in an owned conversation |
-| POST | `/conversations/{id}/messages` | bearer | Save a customer message and temporary assistant reply (`201`) |
+| POST | `/conversations/{id}/messages` | bearer | Save a customer message and generate an assistant reply (`201`) |
 | GET | `/orders` | bearer | List only the caller's orders |
 | GET | `/orders/{order_number}` | bearer | Read an owned order (`404` for another customer) |
 | GET | `/admin/users` | admin | List all users (no password hashes) |
@@ -150,11 +192,16 @@ Customers receive `403` on admin endpoints. Another customer's order or
 conversation returns `404`, which avoids revealing that the record exists.
 
 Conversation creation takes its owner from the bearer token. Sending a message
-trims and validates the content, stores the customer message, stores a
-temporary assistant reply, sets the first message as the conversation title,
-and advances the conversation timestamp. The placeholder reply is marked with
-`metadata.temporary = true` so it is easy to replace when an AI provider is
-connected.
+trims and validates the content, stores the customer message, sends the recent
+history plus the customer-support system prompt to the configured provider,
+stores the generated assistant reply, sets the first message as the conversation
+title, and advances the conversation timestamp.
+
+Generated messages include `metadata.source = "llm"`, the provider, model,
+finish reason, token usage, and the id of the message they answer. When a
+provider fails, the reply is stored with `metadata.source = "fallback"` and
+`metadata.fallback = true`; the API still returns `201` so the customer message
+and a useful response remain in the conversation.
 
 ## Tests
 
@@ -172,7 +219,11 @@ conversations, and orders, and deletes them afterwards. It covers:
 - customer/admin authorization, forged role claims, and live role changes;
 - cross-customer order and conversation isolation;
 - conversation creation, message persistence, auto-titles, timestamp updates,
-  chronological reload, and the temporary assistant reply;
+  chronological reload, and provider-generated assistant replies;
+- provider request construction, response normalization, and normalized error
+  mapping for Gemini and Ollama;
+- provider selection through configuration and the generic API-key fallback;
+- controlled fallback replies when a provider fails;
 - message validation and 404s for another customer's conversation;
 - database health failures and sanitized internal errors;
 - Swagger/OpenAPI documentation and the bearer security scheme.
@@ -190,8 +241,8 @@ app/
   schemas/              Pydantic request/response schemas
   repositories/         SQL-only data access (users, conversations, messages,
                         orders, knowledge sources)
-  services/             authentication, ownership, and admin business rules
-  ai/                   LLM and embedding integration (later phase)
+  services/             authentication, ownership, chat, and admin rules
+  ai/                   provider abstraction, Gemini/Ollama adapters, prompts
   knowledge/            ingestion and retrieval (Phase 5)
   tools/                agent tools (later phase)
   main.py               FastAPI app, routers, CORS, sanitized error handler
