@@ -6,9 +6,11 @@ from datetime import datetime
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.ai.prompts import SYSTEM_PROMPT
+from app.ai.providers.base import ProviderRateLimitError
 from app.db.session import SessionLocal
 from app.models import Conversation, Message
-from app.services.conversations import PLACEHOLDER_ASSISTANT_MESSAGE
+from app.services.conversations import FALLBACK_ASSISTANT_MESSAGE
 
 
 def _create_conversation(
@@ -97,13 +99,17 @@ def test_create_conversation_validates_and_normalizes_title(
     assert unexpected_identity.status_code == 422
 
 
-def test_send_message_persists_customer_message_and_placeholder_reply(
+def test_send_message_persists_generated_reply(
     client: TestClient,
     accounts,
     login_headers,
+    fake_llm_provider,
 ) -> None:
     headers = login_headers(accounts["customer_a"]["email"])
     conversation = _create_conversation(client, headers)
+    fake_llm_provider.reply = (
+        "I can help with that. Please share your order number."
+    )
 
     response = client.post(
         f"/conversations/{conversation['id']}/messages",
@@ -116,16 +122,27 @@ def test_send_message_persists_customer_message_and_placeholder_reply(
     assert body["user_message"]["role"] == "user"
     assert body["user_message"]["content"] == "Where is my order?"
     assert body["assistant_message"]["role"] == "assistant"
-    assert body["assistant_message"]["content"] == PLACEHOLDER_ASSISTANT_MESSAGE
+    assert body["assistant_message"]["content"] == fake_llm_provider.reply
     assert body["assistant_message"]["metadata"] == {
-        "temporary": True,
-        "source": "placeholder",
+        "source": "llm",
+        "provider": "stub",
+        "model": "stub-model",
         "reply_to": body["user_message"]["id"],
+        "finish_reason": "stop",
+        "usage": {"input_tokens": 12, "output_tokens": 8},
     }
     assert body["conversation"]["title"] == "Where is my order?"
     assert _parse_timestamp(body["conversation"]["updated_at"]) > (
         _parse_timestamp(conversation["updated_at"])
     )
+
+    assert len(fake_llm_provider.calls) == 1
+    provider_messages = fake_llm_provider.calls[0]
+    assert provider_messages[0].role == "system"
+    assert provider_messages[0].content == SYSTEM_PROMPT
+    assert [
+        (message.role, message.content) for message in provider_messages[1:]
+    ] == [("user", "Where is my order?")]
 
     history = client.get(
         f"/conversations/{conversation['id']}/messages",
@@ -158,10 +175,113 @@ def test_send_message_persists_customer_message_and_placeholder_reply(
         )
         assert [(message.role, message.content) for message in stored] == [
             ("user", "Where is my order?"),
-            ("assistant", PLACEHOLDER_ASSISTANT_MESSAGE),
+            ("assistant", fake_llm_provider.reply),
         ]
     finally:
         session.close()
+
+
+def test_send_message_includes_prior_turns_in_provider_history(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+
+    first = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "My delivery is late"},
+        headers=headers,
+    )
+    assert first.status_code == 201, first.text
+    first_reply = first.json()["assistant_message"]["content"]
+
+    fake_llm_provider.reply = "I can check the tracking status with you."
+    second = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "Can you check the tracking?"},
+        headers=headers,
+    )
+
+    assert second.status_code == 201, second.text
+    assert len(fake_llm_provider.calls) == 2
+    assert [
+        (message.role, message.content)
+        for message in fake_llm_provider.calls[1]
+    ] == [
+        ("system", SYSTEM_PROMPT),
+        ("user", "My delivery is late"),
+        ("assistant", first_reply),
+        ("user", "Can you check the tracking?"),
+    ]
+
+
+def test_provider_failure_persists_a_controlled_fallback(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    fake_llm_provider.error = ProviderRateLimitError(
+        "quota exhausted",
+        provider="stub",
+    )
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "Is my order still arriving?"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["assistant_message"]["content"] == FALLBACK_ASSISTANT_MESSAGE
+    assert body["assistant_message"]["metadata"] == {
+        "source": "fallback",
+        "provider": "stub",
+        "model": "stub-model",
+        "fallback": True,
+        "error": "rate_limit",
+        "reply_to": body["user_message"]["id"],
+    }
+
+    history = client.get(
+        f"/conversations/{conversation['id']}/messages",
+        headers=headers,
+    )
+    assert history.status_code == 200
+    assert [message["content"] for message in history.json()] == [
+        "Is my order still arriving?",
+        FALLBACK_ASSISTANT_MESSAGE,
+    ]
+
+
+def test_unexpected_provider_failure_does_not_leak_details(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    fake_llm_provider.error = RuntimeError("secret vendor stack trace")
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "Please help"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["assistant_message"]["content"] == FALLBACK_ASSISTANT_MESSAGE
+    assert body["assistant_message"]["metadata"]["fallback"] is True
+    assert body["assistant_message"]["metadata"]["error"] == "unexpected_error"
+    assert "secret vendor stack trace" not in response.text
 
 
 def test_first_message_sets_title_and_reload_keeps_history(
@@ -231,6 +351,7 @@ def test_customer_cannot_post_to_another_customers_conversation(
     client: TestClient,
     accounts,
     login_headers,
+    fake_llm_provider,
 ) -> None:
     other_conversation_id = accounts["conversation_b_id"]
     response = client.post(
@@ -242,6 +363,7 @@ def test_customer_cannot_post_to_another_customers_conversation(
     assert response.status_code == 404
     assert response.json()["detail"] == "Conversation not found"
     assert "Private message attempt" not in response.text
+    assert fake_llm_provider.calls == []
 
     owner_view = client.get(
         f"/conversations/{other_conversation_id}/messages",

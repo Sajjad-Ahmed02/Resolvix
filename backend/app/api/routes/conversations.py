@@ -5,6 +5,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.ai.dependencies import get_llm_provider
+from app.ai.providers.base import LLMProvider
 from app.api.dependencies import get_current_user
 from app.db.session import get_db
 from app.models import User
@@ -120,7 +122,7 @@ def list_messages(
     "/{conversation_id}/messages",
     response_model=MessageExchange,
     status_code=status.HTTP_201_CREATED,
-    summary="Save a customer message and temporary assistant reply",
+    summary="Save a customer message and generate an assistant reply",
     responses={
         status.HTTP_404_NOT_FOUND: {
             "model": ErrorResponse,
@@ -128,23 +130,26 @@ def list_messages(
         }
     },
 )
-def send_message(
+async def send_message(
     conversation_id: UUID,
     payload: MessageCreate,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
+    provider: LLMProvider = Depends(get_llm_provider),
 ) -> MessageExchange:
-    """Persist the customer message before returning both new messages.
+    """Persist the customer message and the provider-generated reply.
 
-    The assistant reply is a stored placeholder until an AI provider is added.
-    A different customer's conversation returns 404 and never receives a
-    message.
+    The active provider is selected with ``LLM_PROVIDER``. Provider failures
+    are stored as a controlled fallback reply instead of leaking vendor errors
+    or returning an HTTP 500. A different customer's conversation returns 404
+    and never receives a message.
     """
-    exchange = conversation_service.add_customer_message(
+    exchange = await conversation_service.add_customer_message(
         session,
         conversation_id,
         current_user.id,
         content=payload.content,
+        provider=provider,
     )
     if exchange is None:
         raise HTTPException(

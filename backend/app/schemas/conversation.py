@@ -33,7 +33,7 @@ class MessageCreate(BaseModel):
     """A customer-authored message.
 
     The role is not accepted from the client. Customer messages always persist
-    as ``user`` and the temporary reply always persists as ``assistant``.
+    as ``user`` and the generated reply always persists as ``assistant``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -85,7 +85,7 @@ class ConversationDetail(ConversationRead):
 
 
 class MessageExchange(BaseModel):
-    """The persisted customer message and its temporary assistant reply."""
+    """The persisted customer message and its generated assistant reply."""
 
     conversation: ConversationRead
     user_message: MessageRead

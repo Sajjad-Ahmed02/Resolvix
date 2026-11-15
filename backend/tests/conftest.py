@@ -11,6 +11,7 @@ os.environ.setdefault(
 os.environ.setdefault("DEBUG", "false")
 
 import uuid
+from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -18,6 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
+from app.ai.dependencies import get_llm_provider
+from app.ai.providers.base import (
+    ChatMessage,
+    LLMProvider,
+    LLMResponse,
+)
 from app.core.security import hash_password
 from app.db.session import SessionLocal
 from app.main import app
@@ -25,6 +32,48 @@ from app.models import Conversation, Message, Order, OrderItem, User
 
 
 TEST_PASSWORD = "TestPass123!"
+
+
+class StubLLMProvider(LLMProvider):
+    """Deterministic provider so tests never call a real model vendor."""
+
+    name = "stub"
+    model = "stub-model"
+
+    def __init__(self) -> None:
+        self.calls: list[list[ChatMessage]] = []
+        self.reply = "This is a generated test reply."
+        self.error: Exception | None = None
+        self.closed = False
+
+    async def generate(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> LLMResponse:
+        self.calls.append(list(messages))
+        if self.error is not None:
+            raise self.error
+        return LLMResponse(
+            content=self.reply,
+            provider=self.name,
+            model=self.model,
+            finish_reason="stop",
+            usage={"input_tokens": 12, "output_tokens": 8},
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def fake_llm_provider():
+    """Replace the real provider for every test."""
+    provider = StubLLMProvider()
+    app.dependency_overrides[get_llm_provider] = lambda: provider
+    try:
+        yield provider
+    finally:
+        app.dependency_overrides.pop(get_llm_provider, None)
 
 
 @pytest.fixture(scope="session", autouse=True)
