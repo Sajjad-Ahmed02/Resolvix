@@ -54,9 +54,9 @@ function MessageBubble({ message }) {
           {message.content}
         </div>
 
-        {message.metadata?.temporary ? (
+        {message.metadata?.fallback ? (
           <span className="mt-1.5 text-[11px] text-stone-500">
-            Temporary preview response
+            Automated reply unavailable. Please try again.
           </span>
         ) : null}
       </div>

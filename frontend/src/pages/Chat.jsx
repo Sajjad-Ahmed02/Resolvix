@@ -389,7 +389,7 @@ function Chat() {
                   {isCreating ? "Creating…" : "Start your first conversation"}
                 </button>
               </div>
-            ) : messages.length === 0 ? (
+            ) : messages.length === 0 && !isSending ? (
               <div className="flex flex-1 flex-col items-center justify-center py-16 text-center">
                 <div className="flex h-12 w-12 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500">
                   <ChatIcon className="h-5 w-5" />

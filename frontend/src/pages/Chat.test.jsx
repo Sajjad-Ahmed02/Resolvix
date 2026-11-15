@@ -223,6 +223,9 @@ describe("Chat", () => {
     expect(
       screen.getByRole("button", { name: "Sending message" }),
     ).toBeDisabled();
+    expect(
+      screen.getByLabelText("Resolvix is preparing a reply"),
+    ).toBeInTheDocument();
 
     await act(async () => {
       resolveSend({
@@ -241,8 +244,12 @@ describe("Chat", () => {
         assistant_message: {
           id: "message-assistant",
           role: "assistant",
-          content: "Your message has been saved.",
-          metadata: { temporary: true },
+          content: "Your order is on the way.",
+          metadata: {
+            source: "llm",
+            provider: "gemini",
+            model: "gemini-3.5-flash-lite",
+          },
           created_at: "2026-11-15T10:10:01Z",
         },
       });
@@ -253,11 +260,44 @@ describe("Chat", () => {
       within(messageLog).getByText("Where is my order?"),
     ).toBeInTheDocument();
     expect(
-      within(messageLog).getByText("Your message has been saved."),
+      within(messageLog).getByText("Your order is on the way."),
     ).toBeInTheDocument();
     expect(
-      within(messageLog).getByText("Temporary preview response"),
-    ).toBeInTheDocument();
+      within(messageLog).queryByText("Temporary preview response"),
+    ).not.toBeInTheDocument();
     expect(input).toHaveValue("");
+  });
+
+  it("marks a controlled fallback reply without exposing vendor errors", async () => {
+    conversationService.listConversations.mockResolvedValue([conversation]);
+    conversationService.listMessages.mockResolvedValue([
+      {
+        id: "message-user",
+        role: "user",
+        content: "Is my order delayed?",
+        metadata: null,
+        created_at: "2026-11-15T10:10:00Z",
+      },
+      {
+        id: "message-assistant",
+        role: "assistant",
+        content: "I'm sorry, I can't generate a reply right now.",
+        metadata: {
+          source: "fallback",
+          provider: "gemini",
+          fallback: true,
+          error: "rate_limit",
+        },
+        created_at: "2026-11-15T10:10:01Z",
+      },
+    ]);
+
+    renderChat();
+
+    expect(
+      await screen.findByText(
+        "Automated reply unavailable. Please try again.",
+      ),
+    ).toBeInTheDocument();
   });
 });
