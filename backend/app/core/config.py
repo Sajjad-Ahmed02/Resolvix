@@ -60,29 +60,28 @@ class Settings(BaseSettings):
     # LLM CONFIGURATION
     # ==========================================
 
-    # Active provider: gemini, ollama, openai,
-    # openrouter, groq, or another supported provider.
-
+    # Active provider: gemini (hosted) or ollama (local inference).
     LLM_PROVIDER: str = "gemini"
 
-    # Model identifier for the active provider
-    LLM_MODEL: str = ""
+    # Gemini model identifier. Ollama uses OLLAMA_MODEL instead.
+    LLM_MODEL: str = "gemini-3.5-flash-lite"
 
-    # Generic API credentials and endpoint
+    # Generic API key fallback for providers without a dedicated variable.
+    # Gemini prefers GEMINI_API_KEY.
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = ""
 
     # Generation settings
-    LLM_TIMEOUT: int = 60
-    LLM_TEMPERATURE: float = 0.7
-    LLM_MAX_TOKENS: int = 2048
+    LLM_TIMEOUT: int = Field(default=60, ge=1, le=300)
+    LLM_TEMPERATURE: float = Field(default=0.7, ge=0.0, le=2.0)
+    LLM_MAX_TOKENS: int = Field(default=2048, ge=1, le=32768)
 
     # ==========================================
     # OLLAMA CONFIGURATION
     # ==========================================
 
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3.2"
+    OLLAMA_MODEL: str = "llama3.2:3b"
 
     # ==========================================
     # PROVIDER-SPECIFIC API KEYS
@@ -116,6 +115,12 @@ class Settings(BaseSettings):
                 "random secret instead"
             )
         return normalized
+
+    @field_validator("LLM_PROVIDER")
+    @classmethod
+    def normalize_llm_provider(cls, value: str) -> str:
+        """Accept provider names regardless of case or surrounding spaces."""
+        return value.strip().lower()
 
 
 # Global settings instance
