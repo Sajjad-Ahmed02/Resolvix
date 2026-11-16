@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -84,6 +84,26 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = "llama3.2:3b"
 
     # ==========================================
+    # KNOWLEDGE / RAG CONFIGURATION
+    # ==========================================
+
+    # Local sentence-transformers model. The knowledge_chunks column is
+    # vector(384), so a different model must also produce 384 dimensions.
+    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_DEVICE: str = "cpu"
+    EMBEDDING_BATCH_SIZE: int = Field(default=32, ge=1, le=256)
+
+    # Chunk sizes are measured in model tokens. The model maximum is 256
+    # tokens; ingestion rejects settings that exceed it.
+    KNOWLEDGE_CHUNK_MAX_TOKENS: int = Field(default=200, ge=32, le=512)
+    KNOWLEDGE_CHUNK_OVERLAP_TOKENS: int = Field(default=40, ge=0, le=256)
+
+    # Retrieval returns the nearest chunks. A cosine distance of 0.0 is an
+    # exact match; 2.0 is the opposite direction.
+    RAG_TOP_K: int = Field(default=4, ge=1, le=20)
+    RAG_MAX_DISTANCE: float = Field(default=0.7, ge=0.0, le=2.0)
+
+    # ==========================================
     # PROVIDER-SPECIFIC API KEYS
     # ==========================================
 
@@ -121,6 +141,23 @@ class Settings(BaseSettings):
     def normalize_llm_provider(cls, value: str) -> str:
         """Accept provider names regardless of case or surrounding spaces."""
         return value.strip().lower()
+
+    @field_validator("EMBEDDING_MODEL", "EMBEDDING_DEVICE")
+    @classmethod
+    def normalize_embedding_settings(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Embedding settings must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_chunk_settings(self) -> "Settings":
+        if self.KNOWLEDGE_CHUNK_OVERLAP_TOKENS >= self.KNOWLEDGE_CHUNK_MAX_TOKENS:
+            raise ValueError(
+                "KNOWLEDGE_CHUNK_OVERLAP_TOKENS must be smaller than "
+                "KNOWLEDGE_CHUNK_MAX_TOKENS"
+            )
+        return self
 
 
 # Global settings instance

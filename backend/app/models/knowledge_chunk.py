@@ -50,6 +50,15 @@ class KnowledgeChunk(UUIDPrimaryKeyMixin, Base):
         nullable=False,
     )
     embedding_model: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # The source's updated_at value when this chunk was generated. Retrieval
+    # only serves chunks whose version matches the current source, so a failed
+    # re-index cannot leave stale text looking current. Nullable for chunks
+    # created before this column existed; they are re-indexed on the next sync.
+    source_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
