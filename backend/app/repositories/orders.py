@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import Order
+from app.models import Order, OrderItem
 
 
 def list_for_user(
@@ -35,11 +35,13 @@ def get_for_user_by_number(
     """Return an order only when it belongs to ``user_id``.
 
     The user id always comes from the authenticated token, never from a request
-    parameter, body field, or LLM tool argument.
+    parameter, body field, or LLM tool argument. Order numbers are compared
+    case-insensitively because customers may retype them with different
+    casing.
     """
     statement = select(Order).where(
         Order.user_id == user_id,
-        Order.order_number == order_number,
+        func.lower(Order.order_number) == order_number.strip().lower(),
     )
     if with_items:
         statement = statement.options(selectinload(Order.items))
@@ -57,6 +59,24 @@ def get_by_number(
     if with_items:
         statement = statement.options(selectinload(Order.items))
     return session.scalar(statement)
+
+
+def list_items_for_order(
+    session: Session,
+    order_id: UUID,
+) -> list[OrderItem]:
+    """Return items only after the caller has authorized the parent order.
+
+    This deliberately accepts an order id rather than a customer-supplied order
+    number so item access cannot bypass the ownership-scoped order query.
+    """
+    return list(
+        session.scalars(
+            select(OrderItem)
+            .where(OrderItem.order_id == order_id)
+            .order_by(OrderItem.product_name, OrderItem.id)
+        ).all()
+    )
 
 
 def list_all(session: Session) -> list[Order]:
