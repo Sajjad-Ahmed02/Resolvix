@@ -19,6 +19,8 @@ from app.ai.providers.base import (
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    ToolCall,
+    ToolDefinition,
 )
 from app.ai.providers.gemini import GeminiProvider
 from app.ai.providers.ollama import OllamaProvider
@@ -29,6 +31,22 @@ MESSAGES = [
     ChatMessage(role="assistant", content="Please share the order number."),
     ChatMessage(role="user", content="RX-2026-1001"),
 ]
+
+ORDER_TOOL = ToolDefinition(
+    name="get_order_details",
+    description="Look up an order for the signed-in customer.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "order_number": {
+                "type": "string",
+                "description": "The order number.",
+            }
+        },
+        "required": ["order_number"],
+        "additionalProperties": False,
+    },
+)
 
 
 class _FakeGeminiModels:
@@ -117,6 +135,101 @@ def test_gemini_provider_builds_request_and_normalizes_response() -> None:
         "Please share the order number.",
         "RX-2026-1001",
     ]
+
+
+def test_gemini_provider_maps_function_calls_and_tool_messages() -> None:
+    call_part = types.Part(
+        function_call=types.FunctionCall(
+            id="call_gemini_1",
+            name="get_order_details",
+            args={"order_number": "RX-2026-1001"},
+        ),
+        thought_signature=b"opaque-thought-signature",
+    )
+    tool_response = SimpleNamespace(
+        text=None,
+        candidates=[
+            SimpleNamespace(
+                finish_reason=types.FinishReason.STOP,
+                content=types.Content(role="model", parts=[call_part]),
+            )
+        ],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=20,
+            candidates_token_count=5,
+            total_token_count=25,
+        ),
+        model_version="gemini-test-001",
+    )
+    first_client = _FakeGeminiClient(response=tool_response)
+    provider = GeminiProvider(model="gemini-test", client=first_client)
+
+    response = _run(provider.generate(MESSAGES, tools=[ORDER_TOOL]))
+
+    assert response.content == ""
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.id == "call_gemini_1"
+    assert call.name == "get_order_details"
+    assert call.arguments == {"order_number": "RX-2026-1001"}
+    assert call.provider_data == {
+        "thought_signature": b"opaque-thought-signature"
+    }
+
+    request = first_client.aio.models.kwargs
+    declarations = request["config"].tools[0].function_declarations
+    assert [declaration.name for declaration in declarations] == [
+        "get_order_details"
+    ]
+    assert declarations[0].description == ORDER_TOOL.description
+    assert declarations[0].parameters_json_schema == ORDER_TOOL.parameters
+
+    follow_up = list(MESSAGES) + [
+        ChatMessage(role="assistant", content="", tool_calls=(call,)),
+        ChatMessage(
+            role="tool",
+            content='{"ok":true,"data":{"status":"processing"}}',
+            tool_call_id="call_gemini_1",
+            tool_name="get_order_details",
+        ),
+    ]
+    second_client = _FakeGeminiClient(response=_gemini_response("Final reply"))
+    second_provider = GeminiProvider(
+        model="gemini-test",
+        client=second_client,
+    )
+
+    final = _run(second_provider.generate(follow_up, tools=[ORDER_TOOL]))
+
+    assert final.content == "Final reply"
+    contents = second_client.aio.models.kwargs["contents"]
+    assert [content.role for content in contents] == [
+        "user",
+        "model",
+        "user",
+        "model",
+        "user",
+    ]
+    tool_call_part = contents[-2].parts[0]
+    assert tool_call_part.function_call.name == "get_order_details"
+    assert tool_call_part.function_call.args == {
+        "order_number": "RX-2026-1001"
+    }
+    assert tool_call_part.thought_signature == b"opaque-thought-signature"
+    tool_result_part = contents[-1].parts[0]
+    assert tool_result_part.function_response.name == "get_order_details"
+    assert tool_result_part.function_response.id == "call_gemini_1"
+    assert tool_result_part.function_response.response == {
+        "ok": True,
+        "data": {"status": "processing"},
+    }
+    assert [
+        declaration.name
+        for declaration in (
+            second_client.aio.models.kwargs["config"].tools[0]
+            .function_declarations
+        )
+    ] == ["get_order_details"]
 
 
 def test_gemini_provider_maps_rate_limit_and_auth_errors() -> None:
@@ -250,6 +363,112 @@ def test_ollama_provider_normalizes_a_successful_response() -> None:
         "input_tokens": 21,
         "output_tokens": 9,
         "total_tokens": 30,
+    }
+
+
+def test_ollama_provider_maps_tools_and_tool_messages() -> None:
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "llama3.2:3b",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "get_order_details",
+                                    "arguments": {
+                                        "order_number": "RX-2026-1001"
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    "done": True,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 15,
+                    "eval_count": 4,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": "llama3.2:3b",
+                "message": {
+                    "role": "assistant",
+                    "content": "Your order is processing.",
+                },
+                "done": True,
+                "done_reason": "stop",
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            provider = OllamaProvider(client=client)
+            first = await provider.generate(MESSAGES, tools=[ORDER_TOOL])
+            follow_up = list(MESSAGES) + [
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=first.tool_calls,
+                ),
+                ChatMessage(
+                    role="tool",
+                    content='{"ok":true,"data":{"status":"processing"}}',
+                    tool_call_id=first.tool_calls[0].id,
+                    tool_name="get_order_details",
+                ),
+            ]
+            second = await provider.generate(follow_up, tools=[ORDER_TOOL])
+            return first, second
+
+    first, second = _run(run())
+
+    assert first.content == ""
+    assert first.tool_calls[0].id == "call_1"
+    assert first.tool_calls[0].name == "get_order_details"
+    assert first.tool_calls[0].arguments == {
+        "order_number": "RX-2026-1001"
+    }
+    assert second.content == "Your order is processing."
+
+    assert bodies[0]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_order_details",
+                "description": ORDER_TOOL.description,
+                "parameters": ORDER_TOOL.parameters,
+            },
+        }
+    ]
+    assert bodies[1]["messages"][-2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_order_details",
+                    "arguments": {"order_number": "RX-2026-1001"},
+                },
+            }
+        ],
+    }
+    assert bodies[1]["messages"][-1] == {
+        "role": "tool",
+        "tool_name": "get_order_details",
+        "content": '{"ok":true,"data":{"status":"processing"}}',
     }
 
 

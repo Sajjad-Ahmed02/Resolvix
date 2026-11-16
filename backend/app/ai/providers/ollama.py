@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -19,6 +20,8 @@ from app.ai.providers.base import (
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    ToolCall,
+    ToolDefinition,
     normalize_messages,
 )
 
@@ -66,16 +69,17 @@ class OllamaProvider(LLMProvider):
             timeout=httpx.Timeout(timeout),
         )
 
-    async def generate(self, messages: Sequence[ChatMessage]) -> LLMResponse:
+    async def generate(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[ToolDefinition] | None = None,
+    ) -> LLMResponse:
         normalized = normalize_messages(messages)
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {
-                    "role": self._role_for(message),
-                    "content": message.content,
-                }
-                for message in normalized
+                self._message_payload(message) for message in normalized
             ],
             "stream": False,
             "options": {
@@ -83,6 +87,18 @@ class OllamaProvider(LLMProvider):
                 "num_predict": self.max_tokens,
             },
         }
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": definition.name,
+                        "description": definition.description,
+                        "parameters": definition.parameters,
+                    },
+                }
+                for definition in tools
+            ]
 
         try:
             response = await self._client.post(
@@ -144,7 +160,14 @@ class OllamaProvider(LLMProvider):
 
         message = body.get("message") if isinstance(body, dict) else None
         content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.strip():
+        tool_calls = (
+            self._response_tool_calls(message)
+            if isinstance(message, dict)
+            else ()
+        )
+        if (not isinstance(content, str) or not content.strip()) and not (
+            tool_calls
+        ):
             raise ProviderInvalidResponseError(
                 "Ollama returned an empty response.",
                 provider=self.name,
@@ -153,7 +176,7 @@ class OllamaProvider(LLMProvider):
         model = body.get("model") if isinstance(body, dict) else None
         finish_reason = body.get("done_reason") if isinstance(body, dict) else None
         return LLMResponse(
-            content=content.strip(),
+            content=content.strip() if isinstance(content, str) else "",
             provider=self.name,
             model=model if isinstance(model, str) and model.strip() else self.model,
             finish_reason=(
@@ -162,13 +185,87 @@ class OllamaProvider(LLMProvider):
                 else "stop"
             ),
             usage=self._usage(body),
+            tool_calls=tool_calls,
         )
 
     @staticmethod
-    def _role_for(message: ChatMessage) -> str:
-        if message.role in {"system", "assistant"}:
-            return message.role
-        return "user"
+    def _message_payload(message: ChatMessage) -> dict[str, Any]:
+        """Translate a provider-neutral message into Ollama chat format."""
+        if message.role == "tool":
+            return {
+                "role": "tool",
+                "tool_name": message.tool_name,
+                "content": message.content,
+            }
+
+        payload: dict[str, Any] = {
+            "role": {
+                "assistant": "assistant",
+                "system": "system",
+            }.get(message.role, "user"),
+            "content": message.content,
+        }
+        if message.tool_calls:
+            payload["tool_calls"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                }
+                for call in message.tool_calls
+            ]
+        return payload
+
+    @staticmethod
+    def _response_tool_calls(message: dict[str, Any]) -> tuple[ToolCall, ...]:
+        raw_calls = message.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            return ()
+
+        calls: list[ToolCall] = []
+        for index, raw_call in enumerate(raw_calls):
+            if not isinstance(raw_call, dict):
+                continue
+            function = raw_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    logger.warning(
+                        "Ollama returned invalid JSON arguments for tool %r",
+                        name,
+                    )
+                    continue
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                logger.warning(
+                    "Ollama returned non-object arguments for tool %r",
+                    name,
+                )
+                continue
+            raw_id = raw_call.get("id")
+            call_id = (
+                raw_id.strip()
+                if isinstance(raw_id, str) and raw_id.strip()
+                else f"call_{index + 1}"
+            )
+            calls.append(
+                ToolCall(
+                    id=call_id,
+                    name=name.strip(),
+                    arguments=arguments,
+                )
+            )
+        return tuple(calls)
 
     @staticmethod
     def _error_detail(response: httpx.Response) -> str:

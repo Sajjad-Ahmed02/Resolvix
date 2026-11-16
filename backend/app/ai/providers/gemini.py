@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -23,6 +24,8 @@ from app.ai.providers.base import (
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    ToolCall,
+    ToolDefinition,
     normalize_messages,
     split_system_messages,
 )
@@ -67,7 +70,12 @@ class GeminiProvider(LLMProvider):
             )
         self._client = client
 
-    async def generate(self, messages: Sequence[ChatMessage]) -> LLMResponse:
+    async def generate(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[ToolDefinition] | None = None,
+    ) -> LLMResponse:
         normalized = normalize_messages(messages)
         system_instruction, dialogue = split_system_messages(normalized)
         if not dialogue:
@@ -76,18 +84,26 @@ class GeminiProvider(LLMProvider):
                 provider=self.name,
             )
 
-        contents = [
-            types.Content(
-                role="model" if message.role == "assistant" else "user",
-                parts=[types.Part.from_text(text=message.content)],
-            )
-            for message in dialogue
-        ]
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=self.temperature,
-            max_output_tokens=self.max_tokens,
-        )
+        contents = [self._content_for(message) for message in dialogue]
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system_instruction,
+            "temperature": self.temperature,
+            "max_output_tokens": self.max_tokens,
+        }
+        if tools:
+            config_kwargs["tools"] = [
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=definition.name,
+                            description=definition.description,
+                            parameters_json_schema=definition.parameters,
+                        )
+                        for definition in tools
+                    ]
+                )
+            ]
+        config = types.GenerateContentConfig(**config_kwargs)
 
         try:
             response = await self._client.aio.models.generate_content(
@@ -116,11 +132,12 @@ class GeminiProvider(LLMProvider):
                 provider=self.name,
             ) from error
 
-        content = self._response_text(response)
-        if not content:
+        content = self._response_text(response) or ""
+        tool_calls = self._response_tool_calls(response)
+        if not content.strip() and not tool_calls:
             finish_reason = self._finish_reason(response)
             raise ProviderInvalidResponseError(
-                "Gemini returned no text"
+                "Gemini returned no text or tool calls"
                 + (f" (finish reason: {finish_reason})." if finish_reason else "."),
                 provider=self.name,
             )
@@ -131,6 +148,58 @@ class GeminiProvider(LLMProvider):
             model=self._response_model(response),
             finish_reason=self._finish_reason(response),
             usage=self._usage(response),
+            tool_calls=tool_calls,
+        )
+
+    @staticmethod
+    def _content_for(message: ChatMessage) -> types.Content:
+        """Translate a provider-neutral message into one Gemini content."""
+        if message.role == "tool":
+            try:
+                payload = json.loads(message.content)
+            except ValueError:
+                payload = {"result": message.content}
+            if not isinstance(payload, dict):
+                payload = {"result": payload}
+            return types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=message.tool_call_id,
+                            name=message.tool_name,
+                            response=payload,
+                        )
+                    )
+                ],
+            )
+
+        if message.role == "assistant":
+            parts: list[types.Part] = []
+            if message.content.strip():
+                parts.append(types.Part.from_text(text=message.content))
+            for call in message.tool_calls:
+                provider_data = call.provider_data or {}
+                signature = provider_data.get("thought_signature")
+                parts.append(
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            id=call.id,
+                            name=call.name,
+                            args=call.arguments,
+                        ),
+                        thought_signature=(
+                            signature
+                            if isinstance(signature, bytes)
+                            else None
+                        ),
+                    )
+                )
+            return types.Content(role="model", parts=parts)
+
+        return types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=message.content)],
         )
 
     def _map_api_error(self, error: errors.APIError) -> ProviderError:
@@ -197,11 +266,71 @@ class GeminiProvider(LLMProvider):
 
     @staticmethod
     def _response_text(response: Any) -> str | None:
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            content = getattr(candidates[0], "content", None)
+            parts = getattr(content, "parts", None) or []
+            if parts:
+                texts = [
+                    part.text
+                    for part in parts
+                    if isinstance(getattr(part, "text", None), str)
+                    and part.text.strip()
+                    and not getattr(part, "thought", False)
+                ]
+                joined = "".join(texts).strip()
+                return joined or None
+
         try:
             text = response.text
         except Exception:
             return None
         return text if isinstance(text, str) and text.strip() else None
+
+    @staticmethod
+    def _response_tool_calls(response: Any) -> tuple[ToolCall, ...]:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return ()
+        content = getattr(candidates[0], "content", None)
+        parts = getattr(content, "parts", None) or []
+
+        calls: list[ToolCall] = []
+        for index, part in enumerate(parts):
+            function_call = getattr(part, "function_call", None)
+            if function_call is None:
+                continue
+            name = getattr(function_call, "name", None)
+            if not isinstance(name, str) or not name.strip():
+                continue
+            arguments = getattr(function_call, "args", None) or {}
+            if not isinstance(arguments, dict):
+                logger.warning(
+                    "Gemini returned non-object arguments for function call %r",
+                    name,
+                )
+                continue
+            raw_id = getattr(function_call, "id", None)
+            call_id = (
+                raw_id.strip()
+                if isinstance(raw_id, str) and raw_id.strip()
+                else f"call_{index + 1}"
+            )
+            signature = getattr(part, "thought_signature", None)
+            provider_data = (
+                {"thought_signature": signature}
+                if isinstance(signature, bytes) and signature
+                else None
+            )
+            calls.append(
+                ToolCall(
+                    id=call_id,
+                    name=name.strip(),
+                    arguments=arguments,
+                    provider_data=provider_data,
+                )
+            )
+        return tuple(calls)
 
     @staticmethod
     def _finish_reason(response: Any) -> str | None:
