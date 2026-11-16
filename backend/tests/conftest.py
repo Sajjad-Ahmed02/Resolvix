@@ -24,11 +24,23 @@ from app.ai.providers.base import (
     ChatMessage,
     LLMProvider,
     LLMResponse,
+    ToolCall,
+    ToolDefinition,
 )
 from app.core.security import hash_password
 from app.db.session import SessionLocal
+from app.knowledge.dependencies import get_knowledge_retriever
+from app.knowledge.retrieval import RetrievedChunk
 from app.main import app
-from app.models import Conversation, Message, Order, OrderItem, User
+from app.models import (
+    Conversation,
+    FAQ,
+    KnowledgeDocument,
+    Message,
+    Order,
+    OrderItem,
+    User,
+)
 
 
 TEST_PASSWORD = "TestPass123!"
@@ -42,6 +54,8 @@ class StubLLMProvider(LLMProvider):
 
     def __init__(self) -> None:
         self.calls: list[list[ChatMessage]] = []
+        self.tool_definitions: list[tuple[ToolDefinition, ...]] = []
+        self.pending_tool_calls: list[tuple[ToolCall, ...]] = []
         self.reply = "This is a generated test reply."
         self.error: Exception | None = None
         self.closed = False
@@ -49,10 +63,23 @@ class StubLLMProvider(LLMProvider):
     async def generate(
         self,
         messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[ToolDefinition] | None = None,
     ) -> LLMResponse:
         self.calls.append(list(messages))
+        self.tool_definitions.append(tuple(tools or ()))
         if self.error is not None:
             raise self.error
+        if self.pending_tool_calls:
+            tool_calls = self.pending_tool_calls.pop(0)
+            return LLMResponse(
+                content="",
+                provider=self.name,
+                model=self.model,
+                finish_reason="tool_calls",
+                usage={"input_tokens": 12, "output_tokens": 8},
+                tool_calls=tool_calls,
+            )
         return LLMResponse(
             content=self.reply,
             provider=self.name,
@@ -76,10 +103,48 @@ def fake_llm_provider():
         app.dependency_overrides.pop(get_llm_provider, None)
 
 
+class StubKnowledgeRetriever:
+    """Deterministic retriever so tests never load the embedding model."""
+
+    def __init__(self) -> None:
+        self.results: list[RetrievedChunk] = []
+        self.error: Exception | None = None
+        self.queries: list[str] = []
+
+    async def retrieve(
+        self,
+        session,
+        query: str,
+        *,
+        top_k: int | None = None,
+    ) -> list[RetrievedChunk]:
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        return list(self.results)
+
+
+@pytest.fixture(autouse=True)
+def fake_knowledge_retriever():
+    """Replace pgvector retrieval for every API test by default."""
+    retriever = StubKnowledgeRetriever()
+    app.dependency_overrides[get_knowledge_retriever] = lambda: retriever
+    try:
+        yield retriever
+    finally:
+        app.dependency_overrides.pop(get_knowledge_retriever, None)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_stale_test_rows():
     """Remove temporary rows left by an interrupted previous test run."""
     session = SessionLocal()
+    session.execute(delete(FAQ).where(FAQ.category.like("phase5-test-%")))
+    session.execute(
+        delete(KnowledgeDocument).where(
+            KnowledgeDocument.category.like("phase5-test-%")
+        )
+    )
     stale_ids = list(
         session.scalars(
             select(User.id).where(User.email.like("phase2-%"))
@@ -88,7 +153,7 @@ def cleanup_stale_test_rows():
     if stale_ids:
         session.execute(delete(Order).where(Order.user_id.in_(stale_ids)))
         session.execute(delete(User).where(User.id.in_(stale_ids)))
-        session.commit()
+    session.commit()
     session.close()
     yield
 

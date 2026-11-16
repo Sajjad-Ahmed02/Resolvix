@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai.prompts import SYSTEM_PROMPT
-from app.ai.providers.base import ProviderRateLimitError
+from app.ai.providers.base import ProviderRateLimitError, ToolCall
 from app.db.session import SessionLocal
+from app.knowledge.grounding import build_context_prompt
+from app.knowledge.retrieval import RetrievedChunk
 from app.models import Conversation, Message
-from app.services.conversations import FALLBACK_ASSISTANT_MESSAGE
+from app.services.conversations import (
+    FALLBACK_ASSISTANT_MESSAGE,
+    MAX_TOOL_ROUNDS,
+    TOOL_LIMIT_ASSISTANT_MESSAGE,
+)
+from app.tools import order_tools
+from app.tools.order_tools import ORDER_DETAILS_TOOL_NAME
 
 
 def _create_conversation(
@@ -128,6 +139,8 @@ def test_send_message_persists_generated_reply(
         "provider": "stub",
         "model": "stub-model",
         "reply_to": body["user_message"]["id"],
+        "grounded": False,
+        "sources": [],
         "finish_reason": "stop",
         "usage": {"input_tokens": 12, "output_tokens": 8},
     }
@@ -179,6 +192,95 @@ def test_send_message_persists_generated_reply(
         ]
     finally:
         session.close()
+
+
+def test_retrieved_knowledge_is_added_to_the_provider_prompt(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+    fake_knowledge_retriever,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    chunk = RetrievedChunk(
+        source_type="faq",
+        source_id=uuid.uuid4(),
+        title="What is your return window?",
+        category="Returns",
+        chunk_index=0,
+        content=(
+            "Unused products in their original packaging can be returned "
+            "within 30 days of delivery."
+        ),
+        distance=0.18,
+    )
+    fake_knowledge_retriever.results = [chunk]
+    fake_llm_provider.reply = (
+        "According to the Returns and Refunds Policy, unused products can be "
+        "returned within 30 days of delivery."
+    )
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "Can I send back an item after 30 days?"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert fake_knowledge_retriever.queries == [
+        "Can I send back an item after 30 days?"
+    ]
+    assert len(fake_llm_provider.calls) == 1
+    provider_messages = fake_llm_provider.calls[0]
+    assert [message.role for message in provider_messages] == [
+        "system",
+        "system",
+        "user",
+    ]
+    assert provider_messages[0].content == SYSTEM_PROMPT
+    assert provider_messages[1].content == build_context_prompt([chunk])
+    assert "30 days" in provider_messages[1].content
+    assert "What is your return window?" in provider_messages[1].content
+    assert "(Returns)" in provider_messages[1].content
+    assert provider_messages[2].content == (
+        "Can I send back an item after 30 days?"
+    )
+
+    metadata = body["assistant_message"]["metadata"]
+    assert metadata["grounded"] is True
+    assert metadata["sources"] == [chunk.as_metadata()]
+    assert metadata["sources"][0]["title"] == "What is your return window?"
+    assert metadata["sources"][0]["category"] == "Returns"
+
+
+def test_retrieval_failure_still_generates_an_ungrounded_reply(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+    fake_knowledge_retriever,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    fake_knowledge_retriever.error = RuntimeError("embedding model unavailable")
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "What is your return policy?"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert [message.role for message in fake_llm_provider.calls[0]] == [
+        "system",
+        "user",
+    ]
+    assert body["assistant_message"]["metadata"]["grounded"] is False
+    assert body["assistant_message"]["metadata"]["sources"] == []
+    assert "embedding model unavailable" not in response.text
 
 
 def test_send_message_includes_prior_turns_in_provider_history(
@@ -247,6 +349,8 @@ def test_provider_failure_persists_a_controlled_fallback(
         "fallback": True,
         "error": "rate_limit",
         "reply_to": body["user_message"]["id"],
+        "grounded": False,
+        "sources": [],
     }
 
     history = client.get(
@@ -352,6 +456,7 @@ def test_customer_cannot_post_to_another_customers_conversation(
     accounts,
     login_headers,
     fake_llm_provider,
+    fake_knowledge_retriever,
 ) -> None:
     other_conversation_id = accounts["conversation_b_id"]
     response = client.post(
@@ -364,6 +469,7 @@ def test_customer_cannot_post_to_another_customers_conversation(
     assert response.json()["detail"] == "Conversation not found"
     assert "Private message attempt" not in response.text
     assert fake_llm_provider.calls == []
+    assert fake_knowledge_retriever.queries == []
 
     owner_view = client.get(
         f"/conversations/{other_conversation_id}/messages",
@@ -411,3 +517,290 @@ def test_send_message_validates_content_and_unknown_conversation(
         headers=headers,
     )
     assert missing.status_code == 404
+
+
+def test_model_can_request_order_tool_and_receive_database_result(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    order_number = accounts["order_a_number"]
+    fake_llm_provider.pending_tool_calls = [
+        (
+            ToolCall(
+                id="call_order_1",
+                name=ORDER_DETAILS_TOOL_NAME,
+                arguments={"order_number": order_number},
+            ),
+        )
+    ]
+    fake_llm_provider.reply = (
+        "Your order is processing and in transit. It contains two "
+        "USB-C cables and is estimated to arrive today."
+    )
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": f"Where is my order {order_number}?"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["assistant_message"]["content"] == fake_llm_provider.reply
+    metadata = body["assistant_message"]["metadata"]
+    assert metadata["source"] == "llm"
+    assert metadata["tool_rounds"] == 1
+    assert metadata["tool_calls"] == [
+        {
+            "name": ORDER_DETAILS_TOOL_NAME,
+            "arguments": {"order_number": order_number},
+            "status": "ok",
+        }
+    ]
+
+    assert len(fake_llm_provider.calls) == 2
+    first_request = fake_llm_provider.calls[0]
+    assert [message.role for message in first_request] == ["system", "user"]
+    assert [
+        definition.name
+        for definition in fake_llm_provider.tool_definitions[0]
+    ] == [ORDER_DETAILS_TOOL_NAME]
+
+    second_request = fake_llm_provider.calls[1]
+    assert [message.role for message in second_request] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assistant_request = second_request[2]
+    assert assistant_request.content == ""
+    assert assistant_request.tool_calls[0].name == ORDER_DETAILS_TOOL_NAME
+    tool_message = second_request[3]
+    assert tool_message.tool_call_id == "call_order_1"
+    assert tool_message.tool_name == ORDER_DETAILS_TOOL_NAME
+    tool_payload = json.loads(tool_message.content)
+    assert tool_payload["ok"] is True
+    assert tool_payload["data"]["status"] == "processing"
+    assert tool_payload["data"]["shipping_status"] == "in_transit"
+    assert tool_payload["data"]["estimated_delivery"]
+    assert tool_payload["data"]["items"] == [
+        {
+            "product_name": "Test USB-C Cable",
+            "quantity": 2,
+            "unit_price": "9.99",
+        }
+    ]
+
+
+def test_tool_cannot_return_another_customers_order(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    other_order_number = accounts["order_b_number"]
+    fake_llm_provider.pending_tool_calls = [
+        (
+            ToolCall(
+                id="call_order_denied",
+                name=ORDER_DETAILS_TOOL_NAME,
+                arguments={"order_number": other_order_number},
+            ),
+        )
+    ]
+    fake_llm_provider.reply = (
+        "I couldn't find that order for your account. Please check the "
+        "order number."
+    )
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": f"Check order {other_order_number}"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    metadata = body["assistant_message"]["metadata"]
+    assert metadata["tool_calls"] == [
+        {
+            "name": ORDER_DETAILS_TOOL_NAME,
+            "arguments": {"order_number": other_order_number},
+            "status": "error",
+            "error": "order_not_found",
+        }
+    ]
+
+    tool_payload = json.loads(fake_llm_provider.calls[1][-1].content)
+    assert tool_payload["ok"] is False
+    assert tool_payload["error"]["code"] == "order_not_found"
+    assert "data" not in tool_payload
+    assert "Test Bluetooth Speaker" not in response.text
+    assert "49.99" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_error"),
+    [
+        (
+            ORDER_DETAILS_TOOL_NAME,
+            {},
+            "invalid_arguments",
+        ),
+        (
+            ORDER_DETAILS_TOOL_NAME,
+            {"order_number": "RX 2026 1001"},
+            "invalid_arguments",
+        ),
+        (
+            ORDER_DETAILS_TOOL_NAME,
+            {
+                "order_number": "RX-2026-1001",
+                "authenticated_user_id": (
+                    "00000000-0000-0000-0000-000000000000"
+                ),
+            },
+            "invalid_arguments",
+        ),
+        (
+            "execute_sql",
+            {"sql": "SELECT * FROM users"},
+            "unknown_tool",
+        ),
+    ],
+)
+def test_invalid_tool_requests_produce_controlled_results(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+    tool_name: str,
+    arguments: dict,
+    expected_error: str,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    fake_llm_provider.pending_tool_calls = [
+        (
+            ToolCall(
+                id="call_invalid",
+                name=tool_name,
+                arguments=arguments,
+            ),
+        )
+    ]
+    fake_llm_provider.reply = (
+        "I couldn't complete that lookup. Please check the information and "
+        "try again."
+    )
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "Please run the lookup"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    metadata = response.json()["assistant_message"]["metadata"]
+    assert metadata["tool_calls"][0]["status"] == "error"
+    assert metadata["tool_calls"][0]["error"] == expected_error
+
+    tool_payload = json.loads(fake_llm_provider.calls[1][-1].content)
+    assert tool_payload["ok"] is False
+    assert tool_payload["error"]["code"] == expected_error
+    assert "data" not in tool_payload
+
+
+def test_database_failure_produces_a_controlled_tool_result(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+    monkeypatch,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    order_number = accounts["order_a_number"]
+    fake_llm_provider.pending_tool_calls = [
+        (
+            ToolCall(
+                id="call_db_failure",
+                name=ORDER_DETAILS_TOOL_NAME,
+                arguments={"order_number": order_number},
+            ),
+        )
+    ]
+    fake_llm_provider.reply = (
+        "I couldn't check your order right now. Please try again in a moment."
+    )
+
+    def fail(*args, **kwargs):
+        raise SQLAlchemyError("database password=super-secret")
+
+    monkeypatch.setattr(
+        order_tools.orders,
+        "get_for_user_by_number",
+        fail,
+    )
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": f"Check order {order_number}"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["assistant_message"]["content"] == fake_llm_provider.reply
+    metadata = body["assistant_message"]["metadata"]
+    assert metadata["tool_calls"][0]["error"] == "database_error"
+    assert "super-secret" not in response.text
+
+    tool_payload = json.loads(fake_llm_provider.calls[1][-1].content)
+    assert tool_payload["ok"] is False
+    assert tool_payload["error"]["code"] == "database_error"
+    assert "super-secret" not in tool_payload["error"]["message"]
+
+
+def test_repeated_tool_requests_are_bounded(
+    client: TestClient,
+    accounts,
+    login_headers,
+    fake_llm_provider,
+) -> None:
+    headers = login_headers(accounts["customer_a"]["email"])
+    conversation = _create_conversation(client, headers)
+    order_number = accounts["order_a_number"]
+    fake_llm_provider.pending_tool_calls = [
+        (
+            ToolCall(
+                id=f"call_loop_{index}",
+                name=ORDER_DETAILS_TOOL_NAME,
+                arguments={"order_number": order_number},
+            ),
+        )
+        for index in range(MAX_TOOL_ROUNDS + 1)
+    ]
+
+    response = client.post(
+        f"/conversations/{conversation['id']}/messages",
+        json={"content": "Keep checking my order"},
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["assistant_message"]["content"] == TOOL_LIMIT_ASSISTANT_MESSAGE
+    metadata = body["assistant_message"]["metadata"]
+    assert metadata["source"] == "tool_limit"
+    assert metadata["error"] == "tool_round_limit"
+    assert metadata["tool_rounds"] == MAX_TOOL_ROUNDS
+    assert len(metadata["tool_calls"]) == MAX_TOOL_ROUNDS
+    assert len(fake_llm_provider.calls) == MAX_TOOL_ROUNDS + 1

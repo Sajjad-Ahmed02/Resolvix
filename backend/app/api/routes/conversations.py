@@ -9,6 +9,8 @@ from app.ai.dependencies import get_llm_provider
 from app.ai.providers.base import LLMProvider
 from app.api.dependencies import get_current_user
 from app.db.session import get_db
+from app.knowledge.dependencies import get_knowledge_retriever
+from app.knowledge.retrieval import KnowledgeRetriever
 from app.models import User
 from app.schemas.common import ErrorResponse
 from app.schemas.conversation import (
@@ -136,13 +138,15 @@ async def send_message(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
     provider: LLMProvider = Depends(get_llm_provider),
+    retriever: KnowledgeRetriever = Depends(get_knowledge_retriever),
 ) -> MessageExchange:
     """Persist the customer message and the provider-generated reply.
 
-    The active provider is selected with ``LLM_PROVIDER``. Provider failures
-    are stored as a controlled fallback reply instead of leaking vendor errors
-    or returning an HTTP 500. A different customer's conversation returns 404
-    and never receives a message.
+    The active provider is selected with ``LLM_PROVIDER``. Relevant FAQ and
+    policy chunks are retrieved with local embeddings and added to the system
+    context. Provider failures are stored as a controlled fallback reply
+    instead of leaking vendor errors or returning an HTTP 500. A different
+    customer's conversation returns 404 and never receives a message.
     """
     exchange = await conversation_service.add_customer_message(
         session,
@@ -150,6 +154,7 @@ async def send_message(
         current_user.id,
         content=payload.content,
         provider=provider,
+        retriever=retriever,
     )
     if exchange is None:
         raise HTTPException(
