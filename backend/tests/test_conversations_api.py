@@ -124,14 +124,14 @@ def test_send_message_persists_generated_reply(
 
     response = client.post(
         f"/conversations/{conversation['id']}/messages",
-        json={"content": "  Where is my order?  "},
+        json={"content": "  What can Resolvix help with?  "},
         headers=headers,
     )
 
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["user_message"]["role"] == "user"
-    assert body["user_message"]["content"] == "Where is my order?"
+    assert body["user_message"]["content"] == "What can Resolvix help with?"
     assert body["assistant_message"]["role"] == "assistant"
     assert body["assistant_message"]["content"] == fake_llm_provider.reply
     assert body["assistant_message"]["metadata"] == {
@@ -139,12 +139,15 @@ def test_send_message_persists_generated_reply(
         "provider": "stub",
         "model": "stub-model",
         "reply_to": body["user_message"]["id"],
+        "intent": "general",
+        "capabilities": ["llm_response"],
         "grounded": False,
         "sources": [],
+        "context_messages": 0,
         "finish_reason": "stop",
         "usage": {"input_tokens": 12, "output_tokens": 8},
     }
-    assert body["conversation"]["title"] == "Where is my order?"
+    assert body["conversation"]["title"] == "What can Resolvix help with?"
     assert _parse_timestamp(body["conversation"]["updated_at"]) > (
         _parse_timestamp(conversation["updated_at"])
     )
@@ -155,7 +158,7 @@ def test_send_message_persists_generated_reply(
     assert provider_messages[0].content == SYSTEM_PROMPT
     assert [
         (message.role, message.content) for message in provider_messages[1:]
-    ] == [("user", "Where is my order?")]
+    ] == [("user", "What can Resolvix help with?")]
 
     history = client.get(
         f"/conversations/{conversation['id']}/messages",
@@ -187,7 +190,7 @@ def test_send_message_persists_generated_reply(
             ).all()
         )
         assert [(message.role, message.content) for message in stored] == [
-            ("user", "Where is my order?"),
+            ("user", "What can Resolvix help with?"),
             ("assistant", fake_llm_provider.reply),
         ]
     finally:
@@ -276,10 +279,21 @@ def test_retrieval_failure_still_generates_an_ungrounded_reply(
     body = response.json()
     assert [message.role for message in fake_llm_provider.calls[0]] == [
         "system",
+        "system",
         "user",
     ]
-    assert body["assistant_message"]["metadata"]["grounded"] is False
-    assert body["assistant_message"]["metadata"]["sources"] == []
+    assert "could not complete" in fake_llm_provider.calls[0][1].content
+    metadata = body["assistant_message"]["metadata"]
+    assert metadata["grounded"] is False
+    assert metadata["sources"] == []
+    assert metadata["tool_calls"] == [
+        {
+            "name": "search_knowledge_base",
+            "arguments": {"query": "What is your return policy?"},
+            "status": "error",
+            "error": "knowledge_unavailable",
+        }
+    ]
     assert "embedding model unavailable" not in response.text
 
 
@@ -294,16 +308,16 @@ def test_send_message_includes_prior_turns_in_provider_history(
 
     first = client.post(
         f"/conversations/{conversation['id']}/messages",
-        json={"content": "My delivery is late"},
+        json={"content": "Hello"},
         headers=headers,
     )
     assert first.status_code == 201, first.text
     first_reply = first.json()["assistant_message"]["content"]
 
-    fake_llm_provider.reply = "I can check the tracking status with you."
+    fake_llm_provider.reply = "I can help with orders, returns, and payments."
     second = client.post(
         f"/conversations/{conversation['id']}/messages",
-        json={"content": "Can you check the tracking?"},
+        json={"content": "What can Resolvix help with?"},
         headers=headers,
     )
 
@@ -314,9 +328,9 @@ def test_send_message_includes_prior_turns_in_provider_history(
         for message in fake_llm_provider.calls[1]
     ] == [
         ("system", SYSTEM_PROMPT),
-        ("user", "My delivery is late"),
+        ("user", "Hello"),
         ("assistant", first_reply),
-        ("user", "Can you check the tracking?"),
+        ("user", "What can Resolvix help with?"),
     ]
 
 
@@ -335,7 +349,7 @@ def test_provider_failure_persists_a_controlled_fallback(
 
     response = client.post(
         f"/conversations/{conversation['id']}/messages",
-        json={"content": "Is my order still arriving?"},
+        json={"content": "What can Resolvix help with?"},
         headers=headers,
     )
 
@@ -349,8 +363,11 @@ def test_provider_failure_persists_a_controlled_fallback(
         "fallback": True,
         "error": "rate_limit",
         "reply_to": body["user_message"]["id"],
+        "intent": "general",
+        "capabilities": ["llm_response"],
         "grounded": False,
         "sources": [],
+        "context_messages": 0,
     }
 
     history = client.get(
@@ -359,7 +376,7 @@ def test_provider_failure_persists_a_controlled_fallback(
     )
     assert history.status_code == 200
     assert [message["content"] for message in history.json()] == [
-        "Is my order still arriving?",
+        "What can Resolvix help with?",
         FALLBACK_ASSISTANT_MESSAGE,
     ]
 
@@ -376,7 +393,7 @@ def test_unexpected_provider_failure_does_not_leak_details(
 
     response = client.post(
         f"/conversations/{conversation['id']}/messages",
-        json={"content": "Please help"},
+        json={"content": "What can Resolvix help with?"},
         headers=headers,
     )
 
@@ -519,7 +536,7 @@ def test_send_message_validates_content_and_unknown_conversation(
     assert missing.status_code == 404
 
 
-def test_model_can_request_order_tool_and_receive_database_result(
+def test_order_question_uses_a_trusted_preflight_lookup(
     client: TestClient,
     accounts,
     login_headers,
@@ -528,15 +545,6 @@ def test_model_can_request_order_tool_and_receive_database_result(
     headers = login_headers(accounts["customer_a"]["email"])
     conversation = _create_conversation(client, headers)
     order_number = accounts["order_a_number"]
-    fake_llm_provider.pending_tool_calls = [
-        (
-            ToolCall(
-                id="call_order_1",
-                name=ORDER_DETAILS_TOOL_NAME,
-                arguments={"order_number": order_number},
-            ),
-        )
-    ]
     fake_llm_provider.reply = (
         "Your order is processing and in transit. It contains two "
         "USB-C cables and is estimated to arrive today."
@@ -553,7 +561,9 @@ def test_model_can_request_order_tool_and_receive_database_result(
     assert body["assistant_message"]["content"] == fake_llm_provider.reply
     metadata = body["assistant_message"]["metadata"]
     assert metadata["source"] == "llm"
-    assert metadata["tool_rounds"] == 1
+    assert metadata["intent"] == "order_status"
+    assert metadata["capabilities"] == ["order_lookup", "llm_response"]
+    assert metadata["tool_rounds"] == 0
     assert metadata["tool_calls"] == [
         {
             "name": ORDER_DETAILS_TOOL_NAME,
@@ -562,42 +572,43 @@ def test_model_can_request_order_tool_and_receive_database_result(
         }
     ]
 
-    assert len(fake_llm_provider.calls) == 2
-    first_request = fake_llm_provider.calls[0]
-    assert [message.role for message in first_request] == ["system", "user"]
+    # The trusted lookup runs before the provider, so the model receives the
+    # order facts as system context instead of having to request the tool.
+    assert len(fake_llm_provider.calls) == 1
+    request = fake_llm_provider.calls[0]
+    assert [message.role for message in request] == ["system", "system", "user"]
+    assert order_number in request[1].content
+    assert '"status":"processing"' in request[1].content
+    assert '"shipping_status":"in_transit"' in request[1].content
+    assert '"product_name":"Test USB-C Cable"' in request[1].content
     assert [
         definition.name
         for definition in fake_llm_provider.tool_definitions[0]
     ] == [ORDER_DETAILS_TOOL_NAME]
 
-    second_request = fake_llm_provider.calls[1]
-    assert [message.role for message in second_request] == [
-        "system",
+    history = client.get(
+        f"/conversations/{conversation['id']}/messages",
+        headers=headers,
+    )
+    assert history.status_code == 200
+    assert [message["role"] for message in history.json()] == [
         "user",
-        "assistant",
         "tool",
+        "assistant",
     ]
-    assistant_request = second_request[2]
-    assert assistant_request.content == ""
-    assert assistant_request.tool_calls[0].name == ORDER_DETAILS_TOOL_NAME
-    tool_message = second_request[3]
-    assert tool_message.tool_call_id == "call_order_1"
-    assert tool_message.tool_name == ORDER_DETAILS_TOOL_NAME
-    tool_payload = json.loads(tool_message.content)
-    assert tool_payload["ok"] is True
-    assert tool_payload["data"]["status"] == "processing"
-    assert tool_payload["data"]["shipping_status"] == "in_transit"
-    assert tool_payload["data"]["estimated_delivery"]
-    assert tool_payload["data"]["items"] == [
-        {
-            "product_name": "Test USB-C Cable",
-            "quantity": 2,
-            "unit_price": "9.99",
-        }
-    ]
+    tool_message = history.json()[1]
+    assert tool_message["metadata"]["tool"] == ORDER_DETAILS_TOOL_NAME
+    assert tool_message["metadata"]["status"] == "ok"
+    assert tool_message["metadata"]["preflight"] is True
+    assert tool_message["metadata"]["order_summary"] == {
+        "status": "processing",
+        "shipping_status": "in_transit",
+        "estimated_delivery": datetime.today().date().isoformat(),
+        "total_amount": "19.98",
+    }
 
 
-def test_tool_cannot_return_another_customers_order(
+def test_order_preflight_cannot_return_another_customers_order(
     client: TestClient,
     accounts,
     login_headers,
@@ -606,15 +617,6 @@ def test_tool_cannot_return_another_customers_order(
     headers = login_headers(accounts["customer_a"]["email"])
     conversation = _create_conversation(client, headers)
     other_order_number = accounts["order_b_number"]
-    fake_llm_provider.pending_tool_calls = [
-        (
-            ToolCall(
-                id="call_order_denied",
-                name=ORDER_DETAILS_TOOL_NAME,
-                arguments={"order_number": other_order_number},
-            ),
-        )
-    ]
     fake_llm_provider.reply = (
         "I couldn't find that order for your account. Please check the "
         "order number."
@@ -638,12 +640,27 @@ def test_tool_cannot_return_another_customers_order(
         }
     ]
 
-    tool_payload = json.loads(fake_llm_provider.calls[1][-1].content)
-    assert tool_payload["ok"] is False
-    assert tool_payload["error"]["code"] == "order_not_found"
-    assert "data" not in tool_payload
+    request = fake_llm_provider.calls[0]
+    assert [message.role for message in request] == ["system", "system", "user"]
+    assert "did not succeed" in request[1].content
+    assert other_order_number in request[1].content
+    assert "Test Bluetooth Speaker" not in request[1].content
+    assert "49.99" not in request[1].content
     assert "Test Bluetooth Speaker" not in response.text
     assert "49.99" not in response.text
+
+    history = client.get(
+        f"/conversations/{conversation['id']}/messages",
+        headers=headers,
+    )
+    assert history.status_code == 200
+    assert [message["role"] for message in history.json()] == [
+        "user",
+        "tool",
+        "assistant",
+    ]
+    assert history.json()[1]["metadata"]["status"] == "error"
+    assert history.json()[1]["metadata"]["error"] == "order_not_found"
 
 
 @pytest.mark.parametrize(
@@ -703,14 +720,16 @@ def test_invalid_tool_requests_produce_controlled_results(
 
     response = client.post(
         f"/conversations/{conversation['id']}/messages",
-        json={"content": "Please run the lookup"},
+        json={"content": f"Check order {accounts['order_a_number']}"},
         headers=headers,
     )
 
     assert response.status_code == 201, response.text
     metadata = response.json()["assistant_message"]["metadata"]
-    assert metadata["tool_calls"][0]["status"] == "error"
-    assert metadata["tool_calls"][0]["error"] == expected_error
+    # The first audit entry is the trusted preflight; the model's invalid
+    # request is the final entry.
+    assert metadata["tool_calls"][-1]["status"] == "error"
+    assert metadata["tool_calls"][-1]["error"] == expected_error
 
     tool_payload = json.loads(fake_llm_provider.calls[1][-1].content)
     assert tool_payload["ok"] is False
@@ -728,15 +747,6 @@ def test_database_failure_produces_a_controlled_tool_result(
     headers = login_headers(accounts["customer_a"]["email"])
     conversation = _create_conversation(client, headers)
     order_number = accounts["order_a_number"]
-    fake_llm_provider.pending_tool_calls = [
-        (
-            ToolCall(
-                id="call_db_failure",
-                name=ORDER_DETAILS_TOOL_NAME,
-                arguments={"order_number": order_number},
-            ),
-        )
-    ]
     fake_llm_provider.reply = (
         "I couldn't check your order right now. Please try again in a moment."
     )
@@ -763,10 +773,11 @@ def test_database_failure_produces_a_controlled_tool_result(
     assert metadata["tool_calls"][0]["error"] == "database_error"
     assert "super-secret" not in response.text
 
-    tool_payload = json.loads(fake_llm_provider.calls[1][-1].content)
-    assert tool_payload["ok"] is False
-    assert tool_payload["error"]["code"] == "database_error"
-    assert "super-secret" not in tool_payload["error"]["message"]
+    request = fake_llm_provider.calls[0]
+    assert [message.role for message in request] == ["system", "system", "user"]
+    assert "did not succeed" in request[1].content
+    assert "database_error" in request[1].content
+    assert "super-secret" not in request[1].content
 
 
 def test_repeated_tool_requests_are_bounded(

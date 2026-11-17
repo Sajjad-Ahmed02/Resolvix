@@ -4,7 +4,8 @@ FastAPI backend for the Resolvix AI customer-support application, backed by
 PostgreSQL 18 with pgvector. It provides a modular API foundation, JWT
 authentication, role-based authorization, a tested repository/service layer,
 local-embedding semantic RAG over FAQs and policy documents, and a controlled
-tool-calling agent for authenticated order lookups.
+tool-calling agent with deterministic intent routing, bounded conversation
+context, and authenticated order lookups.
 
 ## Requirements
 
@@ -58,12 +59,17 @@ secrets, or provider API keys.
 | `KNOWLEDGE_CHUNK_OVERLAP_TOKENS` | no | `40` | Token overlap between consecutive chunks |
 | `RAG_TOP_K` | no | `4` | Nearest chunks retrieved per customer query |
 | `RAG_MAX_DISTANCE` | no | `0.7` | Cosine-distance cutoff; farther chunks are ignored |
+| `AGENT_CONTEXT_MESSAGE_LIMIT` | no | `100` | Recent message rows loaded before bounded context assembly |
+| `AGENT_MAX_HISTORY_MESSAGES` | no | `40` | Maximum user/assistant messages sent to the provider |
+| `AGENT_MAX_HISTORY_CHARS` | no | `12000` | Character budget for the provider history |
+| `AGENT_MAX_TOOL_ROUNDS` | no | `3` | Maximum model/tool rounds per customer turn |
+| `AGENT_MAX_TOOL_CALLS` | no | `6` | Hard tool-attempt cap per customer turn |
 
 Application settings live in `app/core/config.py`.
 
 ## LLM providers
 
-The chat service depends on one async provider interface; vendor code stays in
+The support agent depends on one async provider interface; vendor code stays in
 `app/ai/providers/`. Select the active provider with `LLM_PROVIDER`:
 
 ```env
@@ -87,7 +93,7 @@ installed from <https://ollama.com/download>; pull the selected model once with
 The selected model must support tool/function calling. The configured
 `gemini-3.5-flash-lite` model and Ollama's `llama3.2:3b` both provide that
 capability. If you switch either model, choose one with tool calling enabled,
-otherwise the model will not request the registered order lookup.
+otherwise the model cannot request the registered order or knowledge tools.
 
 `GEMINI_API_KEY` takes precedence over `LLM_API_KEY`. Keys and private
 endpoints belong in `backend/.env` only. `.env.example` contains placeholders and
@@ -99,18 +105,48 @@ Both adapters translate the same provider-neutral tool definitions into their
 native function/tool-calling formats and normalize model-requested calls back
 into application-owned tool calls. Timeouts, rate limits, missing models,
 connection failures, and malformed responses are converted into one of the
-normalized errors in `app/ai/providers/base.py`. The chat service logs the
+normalized errors in `app/ai/providers/base.py`. The orchestrator logs the
 failure and persists a controlled fallback assistant reply instead of exposing
 vendor details.
 
-## Agent tools
+## Agent orchestration and tools
+
+`app/ai/orchestrator.py` coordinates one support turn end to end. HTTP routing
+and persistence stay in `app/api/` and `app/services/`; the orchestrator owns:
+
+- bounded context construction from recent persisted messages;
+- deterministic intent-to-capability routing;
+- preflight execution of approved backend capabilities;
+- the model -> validate -> execute -> tool-result loop;
+- provider-failure fallback and unsupported-success guards.
+
+`app/ai/context.py` loads a bounded window of recent user/assistant turns for
+the provider. Tool rows stay in the stored conversation for auditing, but they
+are excluded from the provider dialogue. Their safe metadata supplies routing
+hints such as the last successfully looked-up order number.
+
+`app/ai/routing.py` is the routing table:
+
+| Customer request | Capabilities | Behavior |
+|---|---|---|
+| Order status or items, with an order number | `order_lookup`, `llm_response` | Run the registered order tool first, then answer from its result |
+| Return/refund, shipping, or payment policy/FAQ | `knowledge_search`, `llm_response` | Run `search_knowledge_base` first, then answer from retrieved passages |
+| General supported question | `llm_response` | Answer with the system rules and conversation history |
+| Missing order number or ambiguous request | `ask_for_details` | Ask a deterministic clarifying question without calling the provider |
+
+Follow-ups reuse conversation context. For example, after a successful order
+lookup, "When will it arrive?" reuses the last order number. A policy follow-up
+such as "What about opened items?" inherits the previous policy intent and adds
+the earlier question to the knowledge query.
 
 Tools live in `app/tools/` and are intentionally separate from provider code:
 
 - `base.py` defines trusted `ToolContext`, structured `ToolOutcome`, and the
-  `Tool` contract.
-- `order_tools.py` owns the `get_order_details` definition, argument schema,
-  validation, and PostgreSQL lookup.
+  asynchronous `Tool` contract.
+- `order_tools.py` owns `get_order_details`: argument validation and an
+  ownership-scoped PostgreSQL lookup.
+- `knowledge_tools.py` owns `search_knowledge_base`: a focused `query`
+  argument, citation-bearing results, and controlled unavailability errors.
 - `registry.py` is the allow-list. A model can only execute a tool whose name
   is registered; unknown names, malformed arguments, oversized arguments, and
   unexpected failures return controlled tool results.
@@ -123,20 +159,23 @@ order items are fetched only after that check. Not-found and cross-customer
 lookups return the same non-disclosing result. The tool returns status,
 shipping status, estimated delivery, order date, total, and line items.
 
-During a chat request the service runs a bounded loop:
+Each turn executes at most `AGENT_MAX_TOOL_CALLS` tool attempts across at most
+`AGENT_MAX_TOOL_ROUNDS` model rounds. A repeated call with identical arguments
+is rejected as `duplicate_tool_call` without running the backend function.
+Invalid arguments, database errors, retrieval failures, and unknown tools never
+expose raw vendor, SQL, embedding, or internal exception details. A failed
+policy search produces an ungrounded reply with an explicit "cannot confirm"
+instruction; a failed order lookup cannot be turned into a successful status
+claim.
 
-1. send recent history, policy context, and tool schemas to the provider;
-2. validate the requested tool name and arguments;
-3. execute the allow-listed backend function with the trusted request context;
-4. send the structured tool result back to the model;
-5. persist the final customer-visible reply.
-
-At most three tool rounds are executed. Repeated requests, provider failures,
-database errors, invalid arguments, and unknown tools never expose raw vendor,
-SQL, or internal exception details. Customer-visible assistant metadata records
-`tool_calls` (name, validated arguments, status, and error code) and
-`tool_rounds`; tool-result payloads are not stored as separate customer
-messages.
+Conversation history persists user rows, useful tool rows, and assistant rows.
+Tool rows use `role = "tool"` with `metadata.tool`, validated arguments, status,
+error code, and a compact order summary or knowledge citations. Assistant
+metadata records `intent`, `capabilities`, grounding sources, `tool_calls`,
+`tool_rounds`, and the number of context messages used. Provider failures store
+`metadata.source = "fallback"`; clarification replies store
+`metadata.source = "clarification"` with a reason; and a reply rewritten because
+it contradicted a failed lookup stores `metadata.source = "guarded"`.
 
 ## Database
 
@@ -207,11 +246,14 @@ Re-indexing is safe to repeat:
 non-zero if any source fails, and prints a per-source failure line. Ingestion is
 not run automatically at API startup.
 
-Chat retrieval is best-effort: if embedding or the database search fails, the
-service logs the error and answers without reference material. Generated
-assistant messages record `metadata.grounded` (boolean) and
-`metadata.sources` (source type, id, title, category, chunk index, distance) so
-responses can be audited against the retrieved chunks.
+Policy/FAQ turns use the controlled `search_knowledge_base` tool instead of
+unconditional retrieval. If embedding or the database search fails, the
+orchestrator logs the safe error, tells the model that reference material is
+unavailable, and the reply remains ungrounded. Generated assistant messages
+record `metadata.grounded` (boolean) and `metadata.sources` (source type, id,
+title, category, chunk index, distance), so responses can be audited against
+the retrieved chunks. The persisted tool row records the search query, result
+count, and citations.
 
 ## Run the API
 
@@ -293,21 +335,23 @@ Customers receive `403` on admin endpoints. Another customer's order or
 conversation returns `404`, which avoids revealing that the record exists.
 
 Conversation creation takes its owner from the bearer token. Sending a message
-trims and validates the content, retrieves relevant FAQ/policy chunks with the
-local embedding model, stores the customer message, sends the recent history
-plus the customer-support system prompt and retrieved reference material to the
-configured provider, stores the generated assistant reply, sets the first
-message as the conversation title, and advances the conversation timestamp.
+trims and validates the content, checks ownership, stores the customer message,
+loads a bounded recent window, resolves the intent route, executes approved
+preflight capabilities (order lookup or knowledge search), sends the bounded
+history plus grounded results to the configured provider, stores useful tool
+rows and the generated assistant reply, sets the first message as the
+conversation title, and advances the conversation timestamp.
 
 Generated messages include `metadata.source = "llm"`, the provider, model,
-finish reason, token usage, grounding status, retrieved source citations, the
-id of the message they answer, and `tool_calls`/`tool_rounds` when the model
-used a tool. When a provider fails, the reply is stored with
-`metadata.source = "fallback"` and `metadata.fallback = true`. If the model keeps
-requesting tools past the round limit, the stored reply uses
-`metadata.source = "tool_limit"` with `error = "tool_round_limit"`. In both
-cases the API still returns `201` so the customer message and a useful response
-remain in the conversation.
+finish reason, token usage, `intent`, `capabilities`, grounding status,
+retrieved source citations, the id of the message they answer, the number of
+context messages used, and `tool_calls`/`tool_rounds` when a backend capability
+ran. When a provider fails, the reply is stored with
+`metadata.source = "fallback"` and `metadata.fallback = true`. Missing order
+numbers and ambiguous requests store `metadata.source = "clarification"` with a
+reason. If the model keeps requesting tools past the round or call limit, the
+stored reply uses `metadata.source = "tool_limit"`. The API still returns `201`
+so the customer message and a useful response remain in the conversation.
 
 ## Tests
 
@@ -330,12 +374,22 @@ conversations, and orders, and deletes them afterwards. It covers:
   mapping for Gemini and Ollama, including native tool declarations, tool calls,
   and tool-result messages;
 - provider selection through configuration and the generic API-key fallback;
-- controlled fallback replies when a provider fails;
+- deterministic intent routing, order-number extraction and normalization, and
+  follow-up inheritance for orders and policies;
+- bounded conversation context, truncation, tool-row exclusion, and recovery
+  of the last successful order from persisted metadata;
+- controlled fallback replies when a provider fails, including later turns in
+  an existing conversation;
 - order tool lookup of status, shipping status, estimated delivery, and items
-  from PostgreSQL;
+  from PostgreSQL, including trusted preflight lookups and follow-up reuse;
+- knowledge search tool citations, invalid-query rejection, unavailable
+  retrieval handling, and registry scoping;
+- multi-turn order lookup -> arrival follow-up, return-policy follow-up,
+  missing order-number clarification, and consecutive general turns;
 - allow-list rejection of unknown tools and invalid/extra arguments;
 - cross-customer order denial without item retrieval or data disclosure;
-- database-error sanitization and bounded tool rounds;
+- duplicate tool-call prevention, per-round call limits, unsupported order
+  success guards, database-error sanitization, and bounded tool rounds;
 - message validation and 404s for another customer's conversation;
 - local embedding model contract (384 dimensions, 256-token limit) and
   no-truncation guards;
@@ -367,10 +421,12 @@ app/
   schemas/              Pydantic request/response schemas
   repositories/         SQL-only data access (users, conversations, messages,
                         orders, knowledge sources)
-  services/             authentication, ownership, chat, and admin rules
-  ai/                   provider abstraction, Gemini/Ollama adapters, prompts
-  knowledge/            ingestion and retrieval (Phase 5)
-  tools/                allow-listed agent tools (Phase 6)
+  services/             authentication, ownership, conversation persistence,
+                        and admin rules
+  ai/                   orchestrator, routing, bounded context, prompts, and
+                        Gemini/Ollama provider adapters
+  knowledge/            ingestion, retrieval, and grounding
+  tools/                allow-listed order and knowledge tools
   main.py               FastAPI app, routers, CORS, sanitized error handler
 migrations/             Alembic environment and versioned migrations
 scripts/                seed and verification scripts
@@ -378,3 +434,5 @@ tests/                  API and security tests
 ```
 
 Design notes and the ERD: [`../docs/database-design.md`](../docs/database-design.md).
+Agent orchestration, routing, context, and failure handling:
+[`../docs/agent-orchestration.md`](../docs/agent-orchestration.md).

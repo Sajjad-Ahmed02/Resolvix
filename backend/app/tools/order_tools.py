@@ -184,7 +184,7 @@ class OrderDetailsTool(Tool):
         parameters=OrderDetailsArguments.model_json_schema(),
     )
 
-    def execute(
+    async def execute(
         self,
         context: ToolContext,
         arguments: dict[str, Any],

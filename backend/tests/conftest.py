@@ -232,9 +232,13 @@ def accounts():
         Message(role="user", content="Customer B private message")
     ]
 
+    # Order numbers must follow the customer-facing ``RX-2026-1001`` shape so
+    # routing can recognise them in conversation text.
+    order_sequence = f"{uuid.uuid4().int % 100_000_000:08d}"
+
     order_a = Order(
         user_id=customer_a.id,
-        order_number=f"PH2-A-{suffix}",
+        order_number=f"RX-2026-{order_sequence}",
         order_date=now,
         status="processing",
         shipping_status="in_transit",
@@ -250,7 +254,7 @@ def accounts():
     ]
     order_b = Order(
         user_id=customer_b.id,
-        order_number=f"PH2-B-{suffix}",
+        order_number=f"RZ-2026-{order_sequence}",
         order_date=now,
         status="completed",
         shipping_status="delivered",

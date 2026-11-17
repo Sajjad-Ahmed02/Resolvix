@@ -104,6 +104,24 @@ class Settings(BaseSettings):
     RAG_MAX_DISTANCE: float = Field(default=0.7, ge=0.0, le=2.0)
 
     # ==========================================
+    # SUPPORT AGENT ORCHESTRATION
+    # ==========================================
+
+    # Number of recent message rows loaded before building the bounded model
+    # history. Tool messages are included so follow-up routing can recover the
+    # last successfully looked-up order.
+    AGENT_CONTEXT_MESSAGE_LIMIT: int = Field(default=100, ge=10, le=500)
+
+    # Bounded conversation window sent to the provider. Oldest turns are
+    # dropped first, and an oversized newest turn is truncated.
+    AGENT_MAX_HISTORY_MESSAGES: int = Field(default=40, ge=2, le=200)
+    AGENT_MAX_HISTORY_CHARS: int = Field(default=12000, ge=1000, le=100000)
+
+    # Hard limits for the model -> validate -> execute -> tool-result loop.
+    AGENT_MAX_TOOL_ROUNDS: int = Field(default=3, ge=1, le=10)
+    AGENT_MAX_TOOL_CALLS: int = Field(default=6, ge=1, le=20)
+
+    # ==========================================
     # PROVIDER-SPECIFIC API KEYS
     # ==========================================
 

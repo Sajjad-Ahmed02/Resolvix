@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+import asyncio
 import json
+from datetime import date
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
@@ -26,6 +27,10 @@ def _call(arguments: dict, *, name: str = ORDER_DETAILS_TOOL_NAME) -> ToolCall:
     return ToolCall(id="call_test", name=name, arguments=arguments)
 
 
+def _execute(registry, call: ToolCall, context: ToolContext):
+    return asyncio.run(registry.execute(call, context))
+
+
 def test_registry_exposes_only_the_allow_listed_order_tool() -> None:
     registry = build_default_registry()
 
@@ -44,7 +49,8 @@ def test_registry_exposes_only_the_allow_listed_order_tool() -> None:
 def test_order_lookup_returns_status_delivery_and_items(accounts) -> None:
     session = SessionLocal()
     try:
-        outcome = build_default_registry().execute(
+        outcome = _execute(
+            build_default_registry(),
             _call({"order_number": accounts["order_a_number"]}),
             _context(session, accounts["customer_a"]["id"]),
         )
@@ -96,7 +102,8 @@ def test_get_order_details_function_uses_authenticated_user_id(accounts) -> None
 def test_order_numbers_are_normalized_before_lookup(accounts) -> None:
     session = SessionLocal()
     try:
-        outcome = build_default_registry().execute(
+        outcome = _execute(
+            build_default_registry(),
             _call({"order_number": f"  {accounts['order_a_number'].lower()}  "}),
             _context(session, accounts["customer_a"]["id"]),
         )
@@ -129,7 +136,8 @@ def test_other_customers_order_is_not_disclosed(accounts, monkeypatch) -> None:
 
     session = SessionLocal()
     try:
-        outcome = build_default_registry().execute(
+        outcome = _execute(
+            build_default_registry(),
             _call({"order_number": accounts["order_b_number"]}),
             _context(session, accounts["customer_a"]["id"]),
         )
@@ -164,7 +172,8 @@ def test_other_customers_order_is_not_disclosed(accounts, monkeypatch) -> None:
 def test_invalid_or_extra_arguments_are_rejected(accounts, arguments) -> None:
     session = SessionLocal()
     try:
-        outcome = build_default_registry().execute(
+        outcome = _execute(
+            build_default_registry(),
             _call(arguments),
             _context(session, accounts["customer_a"]["id"]),
         )
@@ -178,7 +187,8 @@ def test_invalid_or_extra_arguments_are_rejected(accounts, arguments) -> None:
 def test_unknown_tools_are_rejected_without_execution(accounts) -> None:
     session = SessionLocal()
     try:
-        outcome = build_default_registry().execute(
+        outcome = _execute(
+            build_default_registry(),
             _call(
                 {"sql": "DROP TABLE orders"},
                 name="execute_sql",
@@ -207,9 +217,11 @@ def test_database_failure_returns_a_sanitized_controlled_error(
 
     session = SessionLocal()
     try:
-        outcome = OrderDetailsTool().execute(
-            _context(session, accounts["customer_a"]["id"]),
-            {"order_number": accounts["order_a_number"]},
+        outcome = asyncio.run(
+            OrderDetailsTool().execute(
+                _context(session, accounts["customer_a"]["id"]),
+                {"order_number": accounts["order_a_number"]},
+            )
         )
     finally:
         session.close()
@@ -223,7 +235,8 @@ def test_database_failure_returns_a_sanitized_controlled_error(
 def test_tool_outcome_json_is_small_and_structured(accounts) -> None:
     session = SessionLocal()
     try:
-        outcome = build_default_registry().execute(
+        outcome = _execute(
+            build_default_registry(),
             _call({"order_number": accounts["order_a_number"]}),
             _context(session, accounts["customer_a"]["id"]),
         )

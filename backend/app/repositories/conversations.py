@@ -23,16 +23,22 @@ def get_for_user(
     session: Session,
     conversation_id: UUID,
     user_id: UUID,
+    *,
+    with_messages: bool = True,
 ) -> Conversation | None:
-    """Return a conversation only when it belongs to ``user_id``."""
-    return session.scalar(
-        select(Conversation)
-        .options(selectinload(Conversation.messages))
-        .where(
-            Conversation.id == conversation_id,
-            Conversation.user_id == user_id,
-        )
+    """Return a conversation only when it belongs to ``user_id``.
+
+    Message-sending flows pass ``with_messages=False`` and then load a bounded
+    recent window separately, so a long conversation is never fetched in full
+    just to verify ownership.
+    """
+    statement = select(Conversation).where(
+        Conversation.id == conversation_id,
+        Conversation.user_id == user_id,
     )
+    if with_messages:
+        statement = statement.options(selectinload(Conversation.messages))
+    return session.scalar(statement)
 
 
 def get_by_id(session: Session, conversation_id: UUID) -> Conversation | None:

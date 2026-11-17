@@ -6,6 +6,11 @@ from app.tools.base import (
     ToolContext,
     ToolOutcome,
 )
+from app.tools.knowledge_tools import (
+    KNOWLEDGE_SEARCH_TOOL_NAME,
+    KnowledgeSearchArguments,
+    KnowledgeSearchTool,
+)
 from app.tools.order_tools import (
     ORDER_DETAILS_TOOL_NAME,
     OrderDetailsTool,
@@ -21,6 +26,9 @@ from app.tools.registry import (
 
 __all__ = [
     "DEFAULT_TOOL_REGISTRY",
+    "KNOWLEDGE_SEARCH_TOOL_NAME",
+    "KnowledgeSearchArguments",
+    "KnowledgeSearchTool",
     "ORDER_DETAILS_TOOL_NAME",
     "OrderDetailsTool",
     "OrderLookupUnavailableError",

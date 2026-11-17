@@ -98,7 +98,7 @@ class Tool(ABC):
     definition: ToolDefinition
 
     @abstractmethod
-    def execute(
+    async def execute(
         self,
         context: ToolContext,
         arguments: dict[str, Any],

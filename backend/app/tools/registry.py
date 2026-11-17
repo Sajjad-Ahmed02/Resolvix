@@ -13,7 +13,9 @@ from collections.abc import Iterable
 from typing import Any
 
 from app.ai.providers.base import ToolCall, ToolDefinition
+from app.knowledge.retrieval import KnowledgeRetriever
 from app.tools.base import Tool, ToolArgumentError, ToolContext, ToolOutcome
+from app.tools.knowledge_tools import KnowledgeSearchTool
 from app.tools.order_tools import OrderDetailsTool
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,19 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def execute(
+    def subset(self, names: Iterable[str]) -> "ToolRegistry":
+        """Return a registry restricted to the route's approved tools.
+
+        Missing names are ignored rather than creating placeholder tools. A
+        model that requests a name outside the subset receives the normal
+        unknown-tool result, so route-level allow-listing is enforced before
+        execution.
+        """
+        return ToolRegistry(
+            self._tools[name] for name in names if name in self._tools
+        )
+
+    async def execute(
         self,
         call: ToolCall,
         context: ToolContext,
@@ -106,7 +120,7 @@ class ToolRegistry:
             )
 
         try:
-            outcome = tool.execute(context, arguments)
+            outcome = await tool.execute(context, arguments)
         except ToolArgumentError as error:
             return ToolOutcome(
                 tool_name=call.name,
@@ -140,9 +154,19 @@ class ToolRegistry:
         return outcome
 
 
-def build_default_registry() -> ToolRegistry:
-    """Build the production allow-list. Add new tools only here."""
-    return ToolRegistry([OrderDetailsTool()])
+def build_default_registry(
+    retriever: KnowledgeRetriever | None = None,
+) -> ToolRegistry:
+    """Build the production allow-list. Add new tools only here.
+
+    The order tool is always available. The knowledge tool is included only
+    when a retriever is supplied, which keeps low-level tool tests independent
+    from the embedding stack while production chat receives both capabilities.
+    """
+    tools: list[Tool] = [OrderDetailsTool()]
+    if retriever is not None:
+        tools.append(KnowledgeSearchTool(retriever))
+    return ToolRegistry(tools)
 
 
 DEFAULT_TOOL_REGISTRY = build_default_registry()

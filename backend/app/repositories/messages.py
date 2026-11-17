@@ -24,6 +24,31 @@ def list_for_conversation(
     )
 
 
+def list_recent_for_conversation(
+    session: Session,
+    conversation_id: UUID,
+    *,
+    limit: int,
+) -> list[Message]:
+    """Return the newest *limit* rows in chronological order.
+
+    Callers must verify conversation ownership first. This bounded query keeps
+    context assembly from loading an unbounded conversation history.
+    """
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    rows = list(
+        session.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(limit)
+        ).all()
+    )
+    rows.reverse()
+    return rows
+
+
 def create(
     session: Session,
     conversation_id: UUID,
