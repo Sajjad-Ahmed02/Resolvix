@@ -22,7 +22,7 @@ PostgreSQL 18  +  pgvector
    |                +-- knowledge_chunks.embedding VECTOR(384)
    |                +-- HNSW index (vector_cosine_ops)
    |
-   +-- users, conversations, messages
+   +-- users, refresh_tokens, conversations, messages
    +-- orders, order_items
    +-- faqs, knowledge_documents
 ```
@@ -32,6 +32,7 @@ PostgreSQL 18  +  pgvector
 ```mermaid
 erDiagram
     USERS ||--o{ CONVERSATIONS : owns
+    USERS ||--o{ REFRESH_TOKENS : authenticates
     USERS ||--o{ ORDERS : places
     CONVERSATIONS ||--o{ MESSAGES : contains
     ORDERS ||--o{ ORDER_ITEMS : contains
@@ -44,6 +45,17 @@ erDiagram
         varchar email UK "max 255, lowercase"
         text password_hash "Argon2id hash, never plaintext"
         varchar role "customer or admin"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    REFRESH_TOKENS {
+        uuid id PK
+        uuid user_id FK
+        varchar token_hash UK "SHA-256 digest, 64 chars"
+        timestamptz expires_at "sliding"
+        timestamptz last_used_at "nullable"
+        timestamptz revoked_at "nullable"
         timestamptz created_at
         timestamptz updated_at
     }
@@ -123,6 +135,7 @@ erDiagram
 | Relationship | Cardinality | Foreign key |
 |---|---|---|
 | Users -> Conversations | 1:N | `conversations.user_id` |
+| Users -> RefreshTokens | 1:N | `refresh_tokens.user_id` |
 | Conversations -> Messages | 1:N | `messages.conversation_id` |
 | Users -> Orders | 1:N | `orders.user_id` |
 | Orders -> OrderItems | 1:N | `order_items.order_id` |
@@ -134,6 +147,7 @@ erDiagram
 | Parent row deleted | Child rows | Rule | Reason |
 |---|---|---|---|
 | User | Conversations and their Messages | `ON DELETE CASCADE` | A conversation has no meaning without its owner. |
+| User | RefreshTokens | `ON DELETE CASCADE` | A session cannot outlive its account. |
 | User | Orders | `ON DELETE RESTRICT` | Orders are financial records and must not disappear silently. The application must explicitly handle/archive orders before removing a user. |
 | Conversation | Messages | `ON DELETE CASCADE` | Messages belong to exactly one conversation. |
 | Order | OrderItems | `ON DELETE CASCADE` | Line items belong to exactly one order. |
@@ -157,6 +171,18 @@ deleting through the ORM and deleting through raw SQL behave consistently.
   (`customer`, `admin`).
 - `created_at`, `updated_at` `TIMESTAMPTZ NOT NULL DEFAULT NOW()`.
   `updated_at` is refreshed by SQLAlchemy on ORM updates.
+
+### RefreshTokens
+
+- `user_id` UUID `NOT NULL`, FK to `users.id` with `ON DELETE CASCADE`.
+- `token_hash` `VARCHAR(64) NOT NULL UNIQUE`, check exactly 64 characters. Only
+  the SHA-256 digest of the opaque cookie value is stored.
+- `expires_at` `TIMESTAMPTZ NOT NULL`; slides forward on each successful
+  refresh.
+- `last_used_at` `TIMESTAMPTZ NULL`; audit timestamp for the last refresh.
+- `revoked_at` `TIMESTAMPTZ NULL`; logout and administrative revocation set
+  this without deleting the audit row.
+- Index: `ix_refresh_tokens_user_id`.
 
 ### Conversations
 
@@ -244,6 +270,8 @@ derived and can be deleted and regenerated without losing source content.
 | Index | Table / columns | Purpose |
 |---|---|---|
 | `uq_users_email` | `users(email)` (unique) | Login lookup and duplicate prevention |
+| `uq_refresh_tokens_token_hash` | `refresh_tokens(token_hash)` (unique) | Refresh lookup without storing the raw token |
+| `ix_refresh_tokens_user_id` | `refresh_tokens(user_id)` | Revoke all sessions for a user |
 | `ix_conversations_user_id` | `conversations(user_id)` | List a user's conversations |
 | `ix_messages_conversation_id_created_at` | `messages(conversation_id, created_at)` | Ordered conversation history |
 | `uq_orders_order_number` | `orders(order_number)` (unique) | Order lookup and uniqueness |

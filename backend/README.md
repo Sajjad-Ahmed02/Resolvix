@@ -1,11 +1,12 @@
 # Resolvix Backend
 
 FastAPI backend for the Resolvix AI customer-support application, backed by
-PostgreSQL 18 with pgvector. It provides a modular API foundation, JWT
-authentication, role-based authorization, a tested repository/service layer,
-local-embedding semantic RAG over FAQs and policy documents, and a controlled
-tool-calling agent with deterministic intent routing, bounded conversation
-context, and authenticated order lookups.
+PostgreSQL 18 with pgvector. It provides a modular API foundation, cookie-based
+JWT authentication with revocable refresh sessions, role-based authorization,
+a tested repository/service layer, local-embedding semantic RAG over FAQs and
+policy documents, a controlled tool-calling agent with deterministic intent
+routing, bounded conversation context, authenticated order lookups, and an
+administrator API for managing the synthetic store and knowledge base.
 
 ## Requirements
 
@@ -42,6 +43,12 @@ secrets, or provider API keys.
 | `JWT_ISSUER` | no | `resolvix` | Validated `iss` claim |
 | `JWT_AUDIENCE` | no | `resolvix-api` | Validated `aud` claim |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | no | `30` | Access-token lifetime |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | no | `30` | Sliding refresh-session lifetime |
+| `ACCESS_TOKEN_COOKIE_NAME` | no | `resolvix_access` | HttpOnly access cookie name |
+| `REFRESH_TOKEN_COOKIE_NAME` | no | `resolvix_refresh` | HttpOnly refresh cookie name |
+| `COOKIE_DOMAIN` | no | host-only | Optional cookie domain for subdomain deployments |
+| `COOKIE_SECURE` | no | `false` | Set `true` behind HTTPS |
+| `COOKIE_SAMESITE` | no | `lax` | `lax`, `strict`, or `none` (`none` requires secure cookies) |
 | `DB_CONNECT_TIMEOUT` | no | `5` | PostgreSQL connect timeout in seconds |
 | `CORS_ORIGINS` | no | Vite localhost origins | JSON list of allowed frontend origins |
 | `LLM_PROVIDER` | no | `gemini` | `gemini` (hosted) or `ollama` (local) |
@@ -196,10 +203,10 @@ it contradicted a failed lookup stores `metadata.source = "guarded"`.
 .\venv\Scripts\python.exe -m alembic check
 ```
 
-The schema contains eight application tables:
+The schema contains nine application tables:
 
-`users`, `conversations`, `messages`, `orders`, `order_items`, `faqs`,
-`knowledge_documents`, `knowledge_chunks`.
+`users`, `refresh_tokens`, `conversations`, `messages`, `orders`,
+`order_items`, `faqs`, `knowledge_documents`, `knowledge_chunks`.
 
 `knowledge_chunks.embedding` is `VECTOR(384)` with an HNSW cosine-distance
 index. The seed creates the FAQ/document sources but does not load the embedding
@@ -277,6 +284,24 @@ log in.
 
 These credentials are development-only and use synthetic data.
 
+Browser sessions use two HttpOnly cookies:
+
+- `resolvix_access` contains the short-lived JWT and is sent with every API
+  request (`Path=/`).
+- `resolvix_refresh` contains an opaque, high-entropy refresh token and is only
+  sent to `/auth/*` (`Path=/auth`).
+
+JavaScript cannot read either cookie. The refresh token is stored in PostgreSQL
+only as a SHA-256 digest. `POST /auth/refresh` exchanges a valid refresh cookie
+for a new access cookie and slides both the database and cookie expiry forward,
+so active users stay signed in without re-entering credentials. The refresh
+token is not rotated on every call, which keeps concurrent tabs from
+invalidating each other.
+
+Non-browser clients may continue to use the bearer token returned by
+`POST /auth/login`. The login response still includes `access_token` for API
+clients, tests, and Swagger:
+
 ```powershell
 $body = @{
   email = "alice.morgan@example.com"
@@ -294,6 +319,7 @@ Invoke-RestMethod -Uri http://localhost:8000/auth/me -Headers $headers
 
 In Swagger, call `POST /auth/login`, copy `access_token`, click **Authorize**,
 paste the token, and confirm. The HTTP bearer scheme adds the `Bearer` prefix.
+Protected routes also accept the `Access Cookie` scheme.
 
 Security properties:
 
@@ -306,8 +332,9 @@ Security properties:
   is informational only.
 - Customer identity always comes from the token subject. Routes never accept a
   `user_id` that can override it.
-- Logout is stateless: the client discards the token. Refresh-token revocation
-  is not implemented yet.
+- Logout revokes the presented refresh token and clears both cookies. It does
+  not require a valid access token, so it still works after the access token
+  has expired.
 - Unknown emails and wrong passwords return the same `401` response.
 
 ## Endpoints
@@ -316,23 +343,51 @@ Security properties:
 |---|---|---|---|
 | GET | `/` | public | API root |
 | GET | `/health` | public | API and PostgreSQL health (`503` when DB is down) |
-| POST | `/auth/login` | public | Authenticate and issue a JWT |
-| GET | `/auth/me` | bearer | Return the authenticated user and role |
-| POST | `/auth/logout` | bearer | Acknowledge stateless logout (`204`) |
-| GET | `/conversations` | bearer | List only the caller's conversations |
-| POST | `/conversations` | bearer | Create a conversation for the caller (`201`) |
-| GET | `/conversations/{id}` | bearer | Read an owned conversation and messages |
-| GET | `/conversations/{id}/messages` | bearer | Read messages in an owned conversation |
-| POST | `/conversations/{id}/messages` | bearer | Save a customer message and generate an assistant reply (`201`) |
-| GET | `/orders` | bearer | List only the caller's orders |
-| GET | `/orders/{order_number}` | bearer | Read an owned order (`404` for another customer) |
+| POST | `/auth/login` | public | Authenticate; set cookies and return a JWT |
+| POST | `/auth/refresh` | refresh cookie | Issue a new access cookie and slide the session expiry |
+| GET | `/auth/me` | cookie or bearer | Return the authenticated user and role |
+| POST | `/auth/logout` | refresh cookie | Revoke the session and clear cookies (`204`) |
+| GET | `/conversations` | cookie or bearer | List only the caller's conversations |
+| POST | `/conversations` | cookie or bearer | Create a conversation for the caller (`201`) |
+| GET | `/conversations/{id}` | cookie or bearer | Read an owned conversation and messages |
+| GET | `/conversations/{id}/messages` | cookie or bearer | Read messages in an owned conversation |
+| POST | `/conversations/{id}/messages` | cookie or bearer | Save a customer message and generate an assistant reply (`201`) |
+| GET | `/orders` | cookie or bearer | List only the caller's orders |
+| GET | `/orders/{order_number}` | cookie or bearer | Read an owned order (`404` for another customer) |
 | GET | `/admin/users` | admin | List all users (no password hashes) |
-| GET | `/admin/orders` | admin | List all orders |
+| GET | `/admin/stats` | admin | Dashboard counts |
+| GET | `/admin/orders` | admin | List orders with owners and line items |
+| POST | `/admin/orders` | admin | Create a synthetic order (`201`) |
+| GET | `/admin/orders/{id}` | admin | Read one order with line items |
+| PATCH | `/admin/orders/{id}` | admin | Update status, shipping status, or dates |
+| POST | `/admin/orders/{id}/items` | admin | Add a line item and recalculate the total (`201`) |
+| PATCH | `/admin/orders/{id}/items/{item_id}` | admin | Update a line item and recalculate the total |
+| DELETE | `/admin/orders/{id}/items/{item_id}` | admin | Remove a line item and recalculate the total |
 | GET | `/admin/knowledge/faqs` | admin | List FAQs including inactive entries |
+| POST | `/admin/knowledge/faqs` | admin | Create an FAQ and index it (`201`) |
+| GET | `/admin/knowledge/faqs/{id}` | admin | Read one FAQ |
+| PUT | `/admin/knowledge/faqs/{id}` | admin | Update an FAQ and re-index it |
+| DELETE | `/admin/knowledge/faqs/{id}` | admin | Delete an FAQ and its chunks (`204`) |
+| POST | `/admin/knowledge/faqs/{id}/reindex` | admin | Re-index one FAQ (`502` on failure) |
 | GET | `/admin/knowledge/documents` | admin | List documents including inactive entries |
+| POST | `/admin/knowledge/documents` | admin | Create a document and generate embeddings (`201`) |
+| GET | `/admin/knowledge/documents/{id}` | admin | Read one document |
+| PUT | `/admin/knowledge/documents/{id}` | admin | Update a document, chunk it, and re-index it |
+| DELETE | `/admin/knowledge/documents/{id}` | admin | Delete a document and its chunks (`204`) |
+| POST | `/admin/knowledge/documents/{id}/reindex` | admin | Re-index one document (`502` on failure) |
+| POST | `/admin/knowledge/reindex` | admin | Re-index every FAQ and document |
+| GET | `/admin/conversations` | admin | List every conversation with owner and message count |
+| GET | `/admin/conversations/{id}` | admin | Inspect one conversation and all messages |
+| POST | `/admin/ai/test` | admin | Run a real orchestrator turn and inspect metadata |
 
 Customers receive `403` on admin endpoints. Another customer's order or
 conversation returns `404`, which avoids revealing that the record exists.
+
+FAQ and document mutations commit the source first, then synchronize chunks and
+embeddings. Their responses include `indexing.status` (`indexed`, `refreshed`,
+`skipped`, `deleted`, or `failed`) and an `indexing.error` message when
+embedding fails, so a failed sync is never reported as success. Dedicated
+re-index endpoints return `502` with the failure reason.
 
 Conversation creation takes its owner from the bearer token. Sending a message
 trims and validates the content, checks ownership, stores the customer message,
@@ -363,6 +418,8 @@ The suite uses the configured PostgreSQL database, creates isolated users,
 conversations, and orders, and deletes them afterwards. It covers:
 
 - valid, wrong-password, unknown-email, and normalized-email logins;
+- HttpOnly cookie issuance, `/auth/refresh` rotation, sliding expiry, and
+  logout revocation;
 - Argon2id hashing, legacy-hash upgrades, JWT round-trips, expiry, tampering,
   wrong token type, and wrong signing key;
 - missing/invalid tokens on protected endpoints;
@@ -401,8 +458,17 @@ conversations, and orders, and deletes them afterwards. It covers:
   and inactive-source exclusion;
 - grounded prompt construction and `metadata.grounded`/`metadata.sources`
   persistence, plus ungrounded fallback when retrieval fails;
+- administrator authorization on every admin route, including anonymous and
+  customer requests;
+- FAQ/document CRUD, chunk and embedding synchronization, source deactivation,
+  re-index failures reported instead of swallowed, and retrieval exclusion of
+  inactive sources;
+- synthetic order creation, status updates, line-item add/edit/delete, total
+  recalculation, duplicate order numbers, and unknown customers;
+- conversation inspection with messages and metadata, plus admin AI testing
+  through the real orchestrator with multi-turn follow-ups;
 - database health failures and sanitized internal errors;
-- Swagger/OpenAPI documentation and the bearer security scheme.
+- Swagger/OpenAPI documentation for the bearer and cookie security schemes.
 
 The RAG tests load the real local embedding model, so the first test run can
 take longer while the model is cached. They create sources in the
@@ -417,7 +483,7 @@ app/
     routes/             thin HTTP route handlers
   core/                 settings, Argon2id/JWT security helpers
   db/                   SQLAlchemy Base, engine, session, DB health check
-  models/               eight SQLAlchemy models
+  models/               nine SQLAlchemy models
   schemas/              Pydantic request/response schemas
   repositories/         SQL-only data access (users, conversations, messages,
                         orders, knowledge sources)
