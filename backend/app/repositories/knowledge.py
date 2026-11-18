@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import FAQ, KnowledgeChunk, KnowledgeDocument
@@ -57,6 +57,24 @@ def get_document(
     if active_only:
         statement = statement.where(KnowledgeDocument.is_active.is_(True))
     return session.scalar(statement)
+
+
+def count_faqs(session: Session, *, active_only: bool = False) -> int:
+    statement = select(func.count()).select_from(FAQ)
+    if active_only:
+        statement = statement.where(FAQ.is_active.is_(True))
+    return int(session.scalar(statement) or 0)
+
+
+def count_documents(
+    session: Session,
+    *,
+    active_only: bool = False,
+) -> int:
+    statement = select(func.count()).select_from(KnowledgeDocument)
+    if active_only:
+        statement = statement.where(KnowledgeDocument.is_active.is_(True))
+    return int(session.scalar(statement) or 0)
 
 
 def list_chunks_for_faq(

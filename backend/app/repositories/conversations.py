@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from app.models import Conversation
+from app.models import Conversation, Message, User
 
 
 def list_for_user(session: Session, user_id: UUID) -> list[Conversation]:
@@ -44,6 +44,45 @@ def get_for_user(
 def get_by_id(session: Session, conversation_id: UUID) -> Conversation | None:
     """Return any conversation by id. Used by explicitly authorized services."""
     return session.get(Conversation, conversation_id)
+
+
+def get_with_user(
+    session: Session,
+    conversation_id: UUID,
+) -> Conversation | None:
+    """Return any conversation with its owner for administrator inspection."""
+    return session.scalar(
+        select(Conversation)
+        .where(Conversation.id == conversation_id)
+        .options(joinedload(Conversation.user))
+    )
+
+
+def list_all_with_counts(
+    session: Session,
+) -> list[tuple[Conversation, User, int]]:
+    """Return every conversation with its owner and message count."""
+    statement = (
+        select(
+            Conversation,
+            User,
+            func.count(Message.id).label("message_count"),
+        )
+        .join(User, Conversation.user_id == User.id)
+        .outerjoin(Message, Message.conversation_id == Conversation.id)
+        .group_by(Conversation.id, User.id)
+        .order_by(Conversation.updated_at.desc(), Conversation.id)
+    )
+    return [
+        (row[0], row[1], int(row[2]))
+        for row in session.execute(statement).all()
+    ]
+
+
+def count(session: Session) -> int:
+    return int(
+        session.scalar(select(func.count()).select_from(Conversation)) or 0
+    )
 
 
 def create_for_user(

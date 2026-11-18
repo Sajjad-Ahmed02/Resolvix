@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import User
@@ -27,3 +27,10 @@ def list_all(session: Session) -> list[User]:
             select(User).order_by(User.created_at.desc(), User.email)
         ).all()
     )
+
+
+def count(session: Session, *, role: str | None = None) -> int:
+    statement = select(func.count()).select_from(User)
+    if role is not None:
+        statement = statement.where(User.role == role)
+    return int(session.scalar(statement) or 0)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models import Order, OrderItem
 
@@ -79,10 +79,48 @@ def list_items_for_order(
     )
 
 
+def get_by_id(
+    session: Session,
+    order_id: UUID,
+    *,
+    with_items: bool = True,
+) -> Order | None:
+    """Return an order for an explicitly authorized administrator view."""
+    statement = select(Order).where(Order.id == order_id)
+    if with_items:
+        statement = statement.options(
+            selectinload(Order.items),
+            joinedload(Order.user),
+        )
+    return session.scalar(statement)
+
+
+def get_item(
+    session: Session,
+    order_id: UUID,
+    item_id: UUID,
+) -> OrderItem | None:
+    return session.scalar(
+        select(OrderItem).where(
+            OrderItem.id == item_id,
+            OrderItem.order_id == order_id,
+        )
+    )
+
+
 def list_all(session: Session) -> list[Order]:
-    """Return every order for administrator reporting."""
+    """Return every order for administrator management."""
     return list(
         session.scalars(
-            select(Order).order_by(Order.order_date.desc(), Order.id)
+            select(Order)
+            .options(
+                selectinload(Order.items),
+                joinedload(Order.user),
+            )
+            .order_by(Order.order_date.desc(), Order.id)
         ).all()
     )
+
+
+def count(session: Session) -> int:
+    return int(session.scalar(select(func.count()).select_from(Order)) or 0)

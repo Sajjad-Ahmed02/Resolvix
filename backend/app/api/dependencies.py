@@ -6,9 +6,10 @@ from uuid import UUID
 
 import jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import APIKeyCookie, HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.models import User
@@ -24,6 +25,16 @@ bearer_scheme = HTTPBearer(
     ),
 )
 
+access_cookie_scheme = APIKeyCookie(
+    name=settings.ACCESS_TOKEN_COOKIE_NAME,
+    auto_error=False,
+    scheme_name="Access Cookie",
+    description=(
+        "HttpOnly cookie set by POST /auth/login or POST /auth/refresh. "
+        "Browsers use this automatically; JavaScript cannot read it."
+    ),
+)
+
 
 def _credentials_error() -> HTTPException:
     return HTTPException(
@@ -35,20 +46,24 @@ def _credentials_error() -> HTTPException:
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    cookie_token: str | None = Depends(access_cookie_scheme),
     session: Session = Depends(get_db),
 ) -> User:
-    """Resolve the authenticated user from the bearer token.
+    """Resolve the authenticated user from the bearer token or access cookie.
 
     The token subject is the only source of user identity. Request bodies,
     query parameters, and tool arguments can never select a different user.
     The user is reloaded from PostgreSQL on every request so deleted users and
     role changes take effect immediately.
     """
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    token = credentials.credentials if credentials is not None else cookie_token
+    if credentials is not None and credentials.scheme.lower() != "bearer":
+        token = None
+    if not token:
         raise _credentials_error()
 
     try:
-        payload = decode_access_token(credentials.credentials)
+        payload = decode_access_token(token)
         user_id = UUID(payload["sub"])
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
         raise _credentials_error() from None

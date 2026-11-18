@@ -42,6 +42,8 @@ _MAX_LEGACY_ITERATIONS = 10_000_000
 
 ACCESS_TOKEN_TYPE = "access"
 
+REFRESH_TOKEN_BYTES = 48
+
 
 def hash_password(password: str) -> str:
     """Hash a password with Argon2id and a random salt.
@@ -149,6 +151,18 @@ def create_access_token(
         algorithm=settings.JWT_ALGORITHM,
     )
     return token, int(expires_delta.total_seconds())
+
+
+def create_refresh_token_value() -> str:
+    """Return a high-entropy opaque refresh token for an HttpOnly cookie."""
+    return secrets.token_urlsafe(REFRESH_TOKEN_BYTES)
+
+
+def hash_refresh_token(token: str) -> str:
+    """Return the SHA-256 digest stored for an opaque refresh token."""
+    if not token:
+        raise ValueError("Refresh token must not be empty")
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def decode_access_token(token: str) -> dict[str, Any]:

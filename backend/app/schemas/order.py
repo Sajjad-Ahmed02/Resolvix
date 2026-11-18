@@ -42,13 +42,24 @@ class OrderRead(BaseModel):
     items: list[OrderItemRead]
 
 
+class AdminOrderUser(BaseModel):
+    """Minimal customer identity for the administrator order view."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    email: str
+
+
 class AdminOrderRead(BaseModel):
-    """Compact order view for the administrator listing."""
+    """Full order view for administrator management."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
     user_id: UUID
+    user: AdminOrderUser
     order_number: str
     order_date: datetime
     status: OrderStatus
@@ -57,3 +68,4 @@ class AdminOrderRead(BaseModel):
     estimated_delivery: date | None
     created_at: datetime
     updated_at: datetime
+    items: list[OrderItemRead]

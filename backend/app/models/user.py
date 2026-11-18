@@ -10,6 +10,7 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 if TYPE_CHECKING:
     from app.models.conversation import Conversation
     from app.models.order import Order
+    from app.models.refresh_token import RefreshToken
 
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -31,6 +32,11 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     orders: Mapped[list["Order"]] = relationship(
         back_populates="user",
+        passive_deletes=True,
+    )
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
         passive_deletes=True,
     )
 

@@ -29,7 +29,11 @@ from app.ai.providers.base import (
 )
 from app.core.security import hash_password
 from app.db.session import SessionLocal
-from app.knowledge.dependencies import get_knowledge_retriever
+from app.knowledge.dependencies import (
+    get_knowledge_ingestor,
+    get_knowledge_retriever,
+)
+from app.knowledge.ingestion import KnowledgeIngestor
 from app.knowledge.retrieval import RetrievedChunk
 from app.main import app
 from app.models import (
@@ -135,6 +139,47 @@ def fake_knowledge_retriever():
         app.dependency_overrides.pop(get_knowledge_retriever, None)
 
 
+class DeterministicEmbedder:
+    """Token-word embedder so admin ingestion tests stay fast and offline."""
+
+    model_name = "test-embedder"
+    dimension = 384
+    max_seq_length = 256
+
+    def reusable_token_limit(self) -> int:
+        return 254
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+    def encode_tokens(self, text: str) -> list[str]:
+        return text.split()
+
+    def decode_tokens(self, tokens) -> str:
+        return " ".join(tokens)
+
+    async def embed_documents(self, texts):
+        return [[0.5] * 384 for _ in texts]
+
+    async def embed_query(self, text: str):
+        return [0.5] * 384
+
+
+@pytest.fixture(autouse=True)
+def fake_knowledge_ingestor():
+    """Exercise real chunking/database sync without the sentence model."""
+    ingestor = KnowledgeIngestor(
+        DeterministicEmbedder(),
+        max_tokens=200,
+        overlap_tokens=40,
+    )
+    app.dependency_overrides[get_knowledge_ingestor] = lambda: ingestor
+    try:
+        yield ingestor
+    finally:
+        app.dependency_overrides.pop(get_knowledge_ingestor, None)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_stale_test_rows():
     """Remove temporary rows left by an interrupted previous test run."""
@@ -162,6 +207,20 @@ def cleanup_stale_test_rows():
 def client() -> TestClient:
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def isolate_auth_cookies(client: TestClient):
+    """Keep cookie sessions from leaking between tests.
+
+    Login now writes HttpOnly cookies in addition to returning a bearer token.
+    TestClient persists cookies, so each test starts and ends with a clean jar.
+    """
+    client.cookies.clear()
+    try:
+        yield
+    finally:
+        client.cookies.clear()
 
 
 @pytest.fixture()

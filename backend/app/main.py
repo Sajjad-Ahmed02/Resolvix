@@ -20,9 +20,10 @@ logger = logging.getLogger("resolvix")
 app = FastAPI(
     title=settings.APP_NAME,
     description=(
-        "AI-powered customer-support API for Resolvix. "
-        "Authenticate with POST /auth/login, then use the returned JWT as a "
-        "bearer token. Customer identity is always derived from the token."
+        "AI-powered customer-support API for Resolvix. Authenticate with "
+        "POST /auth/login to receive HttpOnly access and refresh cookies, or "
+        "use the returned JWT as a bearer token. Customer identity is always "
+        "derived from the token."
     ),
     version=settings.APP_VERSION,
     debug=False,
@@ -34,8 +35,9 @@ app = FastAPI(
         {
             "name": "Authentication",
             "description": (
-                "JWT login, current-user lookup, and logout. Public "
-                "registration is intentionally disabled."
+                "JWT login, silent refresh, current-user lookup, and logout. "
+                "Browsers use HttpOnly cookies; API clients may use the "
+                "returned bearer token. Public registration is disabled."
             ),
         },
         {

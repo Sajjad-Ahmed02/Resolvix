@@ -45,6 +45,19 @@ class Settings(BaseSettings):
     JWT_AUDIENCE: str = "resolvix-api"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30, ge=1, le=1440)
 
+    # Opaque refresh tokens are stored hashed in PostgreSQL. The browser only
+    # receives them in an HttpOnly cookie, and each successful refresh extends
+    # the sliding expiration so active users stay signed in.
+    REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=30, ge=1, le=365)
+
+    ACCESS_TOKEN_COOKIE_NAME: str = "resolvix_access"
+    REFRESH_TOKEN_COOKIE_NAME: str = "resolvix_refresh"
+    COOKIE_DOMAIN: str | None = None
+    # Set to True whenever the API is served over HTTPS. ``none`` requires a
+    # secure cookie, so the validator below rejects insecure combinations.
+    COOKIE_SECURE: bool = False
+    COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+
     # ==========================================
     # CORS CONFIGURATION
     # ==========================================
@@ -159,6 +172,29 @@ class Settings(BaseSettings):
     def normalize_llm_provider(cls, value: str) -> str:
         """Accept provider names regardless of case or surrounding spaces."""
         return value.strip().lower()
+
+    @field_validator(
+        "ACCESS_TOKEN_COOKIE_NAME",
+        "REFRESH_TOKEN_COOKIE_NAME",
+    )
+    @classmethod
+    def validate_cookie_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Cookie names must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_cookie_settings(self) -> "Settings":
+        if self.COOKIE_SAMESITE == "none" and not self.COOKIE_SECURE:
+            raise ValueError(
+                "COOKIE_SAMESITE=none requires COOKIE_SECURE=true"
+            )
+        if self.ACCESS_TOKEN_COOKIE_NAME == self.REFRESH_TOKEN_COOKIE_NAME:
+            raise ValueError(
+                "Access and refresh cookies must use different names"
+            )
+        return self
 
     @field_validator("EMBEDDING_MODEL", "EMBEDDING_DEVICE")
     @classmethod

@@ -32,9 +32,15 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    """JWT access token plus the authenticated user."""
+    """JWT access token plus the authenticated user.
+
+    Browsers receive the tokens in HttpOnly cookies. The access token is also
+    returned for non-browser API clients and documented tooling; the web client
+    never reads or stores it.
+    """
 
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_in: int
+    refresh_expires_in: int
     user: UserRead

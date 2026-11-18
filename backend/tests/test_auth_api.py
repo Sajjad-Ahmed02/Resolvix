@@ -48,10 +48,30 @@ def test_customer_login_returns_token_and_public_user(
     assert body["access_token"]
     assert body["token_type"] == "bearer"
     assert body["expires_in"] == settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    assert body["refresh_expires_in"] == (
+        settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
+    )
     assert body["user"]["email"] == accounts["customer_a"]["email"]
     assert body["user"]["role"] == "customer"
     assert "password_hash" not in response.text
     assert "$argon2" not in response.text
+
+    cookies = response.headers.get_list("set-cookie")
+    access_cookie = next(
+        cookie
+        for cookie in cookies
+        if cookie.startswith(f"{settings.ACCESS_TOKEN_COOKIE_NAME}=")
+    )
+    refresh_cookie = next(
+        cookie
+        for cookie in cookies
+        if cookie.startswith(f"{settings.REFRESH_TOKEN_COOKIE_NAME}=")
+    )
+    assert "HttpOnly" in access_cookie
+    assert "HttpOnly" in refresh_cookie
+    assert "Path=/;" in access_cookie
+    assert "Path=/auth;" in refresh_cookie
+
 
 
 def test_admin_login_returns_admin_role(client: TestClient, accounts) -> None:
@@ -289,16 +309,129 @@ def test_token_for_deleted_user_is_rejected(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_logout_requires_authentication_and_returns_no_content(
+def test_logout_revokes_the_session_and_clears_cookies(
     client: TestClient,
     accounts,
-    login_headers,
 ) -> None:
-    headers = login_headers(accounts["customer_a"]["email"])
+    login = client.post(
+        "/auth/login",
+        json={
+            "email": accounts["customer_a"]["email"],
+            "password": accounts["password"],
+        },
+    )
+    assert login.status_code == 200
+    refresh_value = client.cookies.get(
+        settings.REFRESH_TOKEN_COOKIE_NAME
+    )
+    assert refresh_value
 
-    unauthorized = client.post("/auth/logout")
-    response = client.post("/auth/logout", headers=headers)
+    response = client.post("/auth/logout")
 
-    assert unauthorized.status_code == 401
     assert response.status_code == 204
     assert response.content == b""
+    assert client.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME) is None
+    assert client.cookies.get(settings.REFRESH_TOKEN_COOKIE_NAME) is None
+
+    # The revoking request itself still carried the refresh cookie, so a
+    # replay must be rejected even though the browser jar has been cleared.
+    replay = client.post(
+        "/auth/refresh",
+        cookies={settings.REFRESH_TOKEN_COOKIE_NAME: refresh_value},
+    )
+    assert replay.status_code == 401
+
+
+def test_logout_without_a_session_is_idempotent(client: TestClient) -> None:
+    response = client.post("/auth/logout")
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+
+def test_me_accepts_the_http_only_access_cookie(
+    client: TestClient,
+    accounts,
+) -> None:
+    login = client.post(
+        "/auth/login",
+        json={
+            "email": accounts["customer_a"]["email"],
+            "password": accounts["password"],
+        },
+    )
+    assert login.status_code == 200
+
+    response = client.get("/auth/me")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(accounts["customer_a"]["id"])
+
+
+def test_refresh_issues_a_new_access_cookie_without_login(
+    client: TestClient,
+    accounts,
+) -> None:
+    login = client.post(
+        "/auth/login",
+        json={
+            "email": accounts["customer_a"]["email"],
+            "password": accounts["password"],
+        },
+    )
+    assert login.status_code == 200
+    original_access = client.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME)
+    assert original_access
+
+    client.cookies.delete(settings.ACCESS_TOKEN_COOKIE_NAME)
+    response = client.post("/auth/refresh")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["user"]["email"] == accounts["customer_a"]["email"]
+    assert body["expires_in"] == settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    refreshed_access = client.cookies.get(settings.ACCESS_TOKEN_COOKIE_NAME)
+    assert refreshed_access
+    assert refreshed_access != original_access
+
+    me = client.get("/auth/me")
+    assert me.status_code == 200
+    assert me.json()["role"] == "customer"
+
+
+def test_refresh_requires_a_valid_refresh_cookie(client: TestClient) -> None:
+    missing = client.post("/auth/refresh")
+    invalid = client.post(
+        "/auth/refresh",
+        cookies={settings.REFRESH_TOKEN_COOKIE_NAME: "not-a-real-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert missing.json()["detail"] == "Session expired. Please sign in again."
+    assert invalid.json()["detail"] == "Session expired. Please sign in again."
+    assert "Traceback" not in invalid.text
+
+
+def test_refresh_rejects_a_guessable_or_tampered_token(
+    client: TestClient,
+    accounts,
+) -> None:
+    client.post(
+        "/auth/login",
+        json={
+            "email": accounts["customer_a"]["email"],
+            "password": accounts["password"],
+        },
+    )
+    valid = client.cookies.get(settings.REFRESH_TOKEN_COOKIE_NAME)
+    assert valid
+    tampered = valid[:-1] + ("A" if valid[-1] != "A" else "B")
+
+    response = client.post(
+        "/auth/refresh",
+        cookies={settings.REFRESH_TOKEN_COOKIE_NAME: tampered},
+    )
+
+    assert response.status_code == 401
+
