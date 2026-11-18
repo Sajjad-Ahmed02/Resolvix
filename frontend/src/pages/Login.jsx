@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Navigate, useLocation, useNavigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 
 import FullPageLoader from "../components/FullPageLoader";
 import { BrandMark } from "../components/icons";
@@ -9,6 +9,8 @@ import { getErrorMessage } from "../utils/apiError";
 
 const DEMO_EMAIL = "alice.morgan@example.com";
 const DEMO_PASSWORD = "Customer123!";
+const DEMO_ADMIN_EMAIL = "admin@resolvix.local";
+const DEMO_ADMIN_PASSWORD = "Admin123!";
 
 const PORTAL_NOTES = [
   ["01", "Sign in with your customer account."],
@@ -19,12 +21,12 @@ const PORTAL_NOTES = [
 function Login() {
   const {
     isAuthenticated,
+    isAdmin,
     isInitializing,
     notice,
     signIn,
     clearNotice,
   } = useAuth();
-  const navigate = useNavigate();
   const location = useLocation();
 
   const [email, setEmail] = useState("");
@@ -33,7 +35,18 @@ function Login() {
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const destination = location.state?.from || "/";
+  // Keep role-appropriate areas separate: administrators default to the
+  // dashboard, while customers stay in the chat. A deep link is honoured only
+  // when it belongs to the signed-in role's area.
+  const requestedDestination = location.state?.from;
+  const isAdminDestination = requestedDestination?.startsWith("/admin");
+  const destination = isAdmin
+    ? isAdminDestination
+      ? requestedDestination
+      : "/admin"
+    : requestedDestination && !isAdminDestination
+      ? requestedDestination
+      : "/";
   const displayedError = error || notice;
 
   if (isInitializing) {
@@ -64,8 +77,9 @@ function Login() {
 
     try {
       const response = await authService.login(normalizedEmail, password);
+      // The authenticated render below is the single redirect path. Calling
+      // navigate() here as well raced it and could send admins to the chat.
       signIn(response);
-      navigate(destination, { replace: true });
     } catch (requestError) {
       setError(
         getErrorMessage(
@@ -223,7 +237,7 @@ function Login() {
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <p className="text-xs font-medium text-stone-500">
-                      Development account
+                      Demo customer
                     </p>
                     <p className="mt-1 text-sm text-stone-800">{DEMO_EMAIL}</p>
                     <p className="mt-0.5 font-mono text-xs text-stone-500">
@@ -236,6 +250,31 @@ function Login() {
                     className="shrink-0 rounded-md border border-stone-300 px-3 py-1.5 text-xs font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-800/20"
                   >
                     Use demo
+                  </button>
+                </div>
+                <div className="mt-4 flex items-start justify-between gap-4 border-t border-stone-100 pt-4">
+                  <div>
+                    <p className="text-xs font-medium text-stone-500">
+                      Demo administrator
+                    </p>
+                    <p className="mt-1 text-sm text-stone-800">
+                      {DEMO_ADMIN_EMAIL}
+                    </p>
+                    <p className="mt-0.5 font-mono text-xs text-stone-500">
+                      {DEMO_ADMIN_PASSWORD}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEmail(DEMO_ADMIN_EMAIL);
+                      setPassword(DEMO_ADMIN_PASSWORD);
+                      setError("");
+                      clearNotice();
+                    }}
+                    className="shrink-0 rounded-md border border-stone-300 px-3 py-1.5 text-xs font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-800/20"
+                  >
+                    Use admin
                   </button>
                 </div>
               </div>
