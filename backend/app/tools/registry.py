@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -75,7 +76,15 @@ class ToolRegistry:
         """Validate and execute one model-requested tool call."""
         tool = self._tools.get(call.name)
         if tool is None:
-            logger.warning("Rejected unknown tool request: %r", call.name)
+            logger.warning(
+                "Rejected unknown tool request",
+                extra={
+                    "event": "tool_rejected",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_code": "unknown_tool",
+                },
+            )
             return ToolOutcome(
                 tool_name=call.name,
                 ok=False,
@@ -85,6 +94,15 @@ class ToolRegistry:
 
         arguments = call.arguments
         if not isinstance(arguments, dict):
+            logger.warning(
+                "Rejected non-object tool arguments",
+                extra={
+                    "event": "tool_rejected",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_code": "invalid_arguments",
+                },
+            )
             return ToolOutcome(
                 tool_name=call.name,
                 ok=False,
@@ -100,6 +118,15 @@ class ToolRegistry:
                 default=str,
             ).encode("utf-8")
         except (TypeError, ValueError):
+            logger.warning(
+                "Rejected unserializable tool arguments",
+                extra={
+                    "event": "tool_rejected",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_code": "invalid_arguments",
+                },
+            )
             return ToolOutcome(
                 tool_name=call.name,
                 ok=False,
@@ -108,9 +135,14 @@ class ToolRegistry:
             )
         if len(encoded) > MAX_TOOL_ARGUMENT_BYTES:
             logger.warning(
-                "Rejected oversized arguments for tool %r (%s bytes)",
-                call.name,
-                len(encoded),
+                "Rejected oversized tool arguments",
+                extra={
+                    "event": "tool_rejected",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_code": "invalid_arguments",
+                    "argument_bytes": len(encoded),
+                },
             )
             return ToolOutcome(
                 tool_name=call.name,
@@ -119,17 +151,45 @@ class ToolRegistry:
                 error_message=INVALID_ARGUMENTS_MESSAGE,
             )
 
+        started = time.perf_counter()
         try:
             outcome = await tool.execute(context, arguments)
         except ToolArgumentError as error:
+            logger.warning(
+                "Tool rejected its arguments",
+                extra={
+                    "event": "tool_rejected",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_code": "invalid_arguments",
+                    "argument_bytes": len(encoded),
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
+            )
             return ToolOutcome(
                 tool_name=call.name,
                 ok=False,
                 error_code="invalid_arguments",
                 error_message=error.safe_message,
             )
-        except Exception:
-            logger.exception("Unexpected failure in tool %r", call.name)
+        except Exception as error:
+            logger.exception(
+                "Unexpected failure in tool",
+                extra={
+                    "event": "tool_error",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_type": type(error).__name__,
+                    "argument_bytes": len(encoded),
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
+            )
             try:
                 context.session.rollback()
             except Exception:  # pragma: no cover - defensive cleanup
@@ -144,13 +204,37 @@ class ToolRegistry:
         if not isinstance(outcome, ToolOutcome) or (
             outcome.tool_name != call.name
         ):
-            logger.error("Tool %r returned an invalid outcome", call.name)
+            logger.error(
+                "Tool returned an invalid outcome",
+                extra={
+                    "event": "tool_error",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "error_code": "invalid_outcome",
+                },
+            )
             return ToolOutcome(
                 tool_name=call.name,
                 ok=False,
                 error_code="tool_failed",
                 error_message=TOOL_FAILED_MESSAGE,
             )
+
+        logger.info(
+            "Tool execution completed",
+            extra={
+                "event": "tool_execution",
+                "operation": "tool_execution",
+                "tool": call.name,
+                "ok": outcome.ok,
+                "error_code": outcome.error_code,
+                "argument_bytes": len(encoded),
+                "duration_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                ),
+            },
+        )
         return outcome
 
 

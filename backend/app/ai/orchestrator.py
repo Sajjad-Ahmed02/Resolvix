@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -40,6 +41,7 @@ from app.ai.routing import (
     Intent,
     resolve_route,
 )
+from app.core.logging import operation_context
 from app.knowledge.grounding import build_context_prompt
 from app.knowledge.retrieval import KnowledgeRetriever, RetrievedChunk
 from app.models import Message
@@ -333,7 +335,77 @@ class SupportAgentOrchestrator:
         content: str,
         previous_messages: Sequence[Message],
     ) -> AgentResult:
-        """Run one turn and return the reply plus safe audit metadata."""
+        """Run one turn under a dedicated operation id.
+
+        Every provider, tool, retrieval, and persistence log emitted inside
+        this call carries the same ``operation_id``, which is separate from the
+        HTTP request id.
+        """
+        started = time.perf_counter()
+        with operation_context() as operation_id:
+            try:
+                result = await self._respond(
+                    session=session,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    content=content,
+                    previous_messages=previous_messages,
+                )
+            except Exception as error:
+                logger.exception(
+                    "Agent turn failed",
+                    extra={
+                        "event": "agent_error",
+                        "operation": "agent_turn",
+                        "conversation_id": str(conversation_id),
+                        "error_type": type(error).__name__,
+                        "duration_ms": round(
+                            (time.perf_counter() - started) * 1000,
+                            2,
+                        ),
+                    },
+                )
+                raise
+
+            logger.info(
+                "Agent turn completed",
+                extra={
+                    "event": "agent_turn",
+                    "operation": "agent_turn",
+                    "operation_ref": operation_id,
+                    "conversation_id": str(conversation_id),
+                    "intent": result.intent.value,
+                    "capabilities": [
+                        capability.value
+                        for capability in result.capabilities
+                    ],
+                    "source": result.source,
+                    "provider": result.provider,
+                    "model": result.model,
+                    "fallback": result.fallback,
+                    "error_code": result.error,
+                    "tool_attempts": len(result.tool_executions),
+                    "retrieved_count": len(result.retrieved),
+                    "history_messages": result.history_message_count,
+                    "history_truncated": result.history_truncated,
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
+            )
+            return result
+
+    async def _respond(
+        self,
+        *,
+        session: Session,
+        user_id: UUID,
+        conversation_id: UUID,
+        content: str,
+        previous_messages: Sequence[Message],
+    ) -> AgentResult:
+        """Run one context-aware support turn and return safe audit metadata."""
         context = build_conversation_context(
             previous_messages,
             max_history_messages=self.max_history_messages,
@@ -453,10 +525,15 @@ class SupportAgentOrchestrator:
             )
         except ProviderError as error:
             logger.warning(
-                "LLM provider %s failed for conversation %s: %s",
-                provider_name,
-                conversation_id,
-                error,
+                "LLM provider failed; returning a controlled fallback",
+                extra={
+                    "event": "agent_fallback",
+                    "operation": "agent_turn",
+                    "provider": provider_name,
+                    "model": model_name,
+                    "conversation_id": str(conversation_id),
+                    "error_code": error.code,
+                },
             )
             return self._failure_result(
                 route=route,
@@ -469,10 +546,18 @@ class SupportAgentOrchestrator:
                 provider=provider_name,
                 model=model_name,
             )
-        except Exception:
+        except Exception as error:
             logger.exception(
-                "Unexpected LLM provider failure for conversation %s",
-                conversation_id,
+                "Unexpected LLM provider failure; returning a controlled fallback",
+                extra={
+                    "event": "agent_fallback",
+                    "operation": "agent_turn",
+                    "provider": provider_name,
+                    "model": model_name,
+                    "conversation_id": str(conversation_id),
+                    "error_type": type(error).__name__,
+                    "error_code": "unexpected_error",
+                },
             )
             return self._failure_result(
                 route=route,
@@ -561,8 +646,16 @@ class SupportAgentOrchestrator:
         signature = budget.signature(call)
         if signature in budget.signatures:
             logger.info(
-                "Prevented duplicate tool execution: %s",
-                call.name,
+                "Prevented duplicate tool execution",
+                extra={
+                    "event": "tool_attempt",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "preflight": preflight,
+                    "executed": False,
+                    "duplicate": True,
+                    "error_code": "duplicate_tool_call",
+                },
             )
             return ToolExecution(
                 call=call,
@@ -579,8 +672,15 @@ class SupportAgentOrchestrator:
 
         if budget.attempts >= budget.max_calls:
             logger.warning(
-                "Tool-call limit reached while requesting %s",
-                call.name,
+                "Tool-call limit reached while requesting a tool",
+                extra={
+                    "event": "tool_attempt",
+                    "operation": "tool_execution",
+                    "tool": call.name,
+                    "preflight": preflight,
+                    "executed": False,
+                    "error_code": "tool_call_limit",
+                },
             )
             return ToolExecution(
                 call=call,
@@ -596,7 +696,25 @@ class SupportAgentOrchestrator:
 
         budget.attempts += 1
         budget.signatures.add(signature)
+        started = time.perf_counter()
         outcome = await registry.execute(call, context)
+        logger.info(
+            "Agent tool attempt finished",
+            extra={
+                "event": "tool_attempt",
+                "operation": "tool_execution",
+                "tool": call.name,
+                "preflight": preflight,
+                "executed": True,
+                "duplicate": False,
+                "ok": outcome.ok,
+                "error_code": outcome.error_code,
+                "duration_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                ),
+            },
+        )
         return ToolExecution(
             call=call,
             outcome=outcome,
@@ -617,9 +735,62 @@ class SupportAgentOrchestrator:
         definitions = registry.definitions
 
         for round_index in range(self.max_tool_rounds + 1):
-            response = await self.provider.generate(
-                messages,
-                tools=definitions or None,
+            started = time.perf_counter()
+            try:
+                response = await self.provider.generate(
+                    messages,
+                    tools=definitions or None,
+                )
+            except ProviderError as error:
+                logger.warning(
+                    "LLM provider returned a controlled error",
+                    extra={
+                        "event": "provider_error",
+                        "operation": "llm_invocation",
+                        "provider": self.provider.name,
+                        "model": self.provider.model,
+                        "provider_round": round_index,
+                        "error_code": error.code,
+                        "duration_ms": round(
+                            (time.perf_counter() - started) * 1000,
+                            2,
+                        ),
+                    },
+                )
+                raise
+            except Exception as error:
+                logger.exception(
+                    "LLM provider failed unexpectedly",
+                    extra={
+                        "event": "provider_error",
+                        "operation": "llm_invocation",
+                        "provider": self.provider.name,
+                        "model": self.provider.model,
+                        "provider_round": round_index,
+                        "error_type": type(error).__name__,
+                        "duration_ms": round(
+                            (time.perf_counter() - started) * 1000,
+                            2,
+                        ),
+                    },
+                )
+                raise
+
+            logger.info(
+                "LLM provider call completed",
+                extra={
+                    "event": "provider_call",
+                    "operation": "llm_invocation",
+                    "provider": response.provider or self.provider.name,
+                    "model": response.model or self.provider.model,
+                    "provider_round": round_index,
+                    "tool_call_count": len(response.tool_calls),
+                    "finish_reason": response.finish_reason,
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
             )
             if not response.tool_calls:
                 return response

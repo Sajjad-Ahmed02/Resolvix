@@ -118,7 +118,17 @@ class OllamaProvider(LLMProvider):
 
         if response.status_code == 404:
             detail = self._error_detail(response)
-            logger.warning("Ollama returned HTTP 404: %s", detail[:500])
+            logger.warning(
+                "Ollama model is not available",
+                extra={
+                    "event": "provider_api_error",
+                    "operation": "llm_invocation",
+                    "provider": self.name,
+                    "model": self.model,
+                    "http_status": 404,
+                    "provider_detail": detail[:500],
+                },
+            )
             raise ProviderModelNotFoundError(
                 f"Ollama model '{self.model}' is not available. "
                 f"Pull it with `ollama pull {self.model}`.",
@@ -131,9 +141,15 @@ class OllamaProvider(LLMProvider):
             )
         if response.status_code >= 500:
             logger.warning(
-                "Ollama returned HTTP %s: %s",
-                response.status_code,
-                self._error_detail(response)[:500],
+                "Ollama is temporarily unavailable",
+                extra={
+                    "event": "provider_api_error",
+                    "operation": "llm_invocation",
+                    "provider": self.name,
+                    "model": self.model,
+                    "http_status": response.status_code,
+                    "provider_detail": self._error_detail(response)[:500],
+                },
             )
             raise ProviderUnavailableError(
                 "Ollama is temporarily unavailable.",
@@ -141,9 +157,15 @@ class OllamaProvider(LLMProvider):
             )
         if response.status_code >= 400:
             logger.warning(
-                "Ollama returned HTTP %s: %s",
-                response.status_code,
-                self._error_detail(response)[:500],
+                "Ollama rejected the request",
+                extra={
+                    "event": "provider_api_error",
+                    "operation": "llm_invocation",
+                    "provider": self.name,
+                    "model": self.model,
+                    "http_status": response.status_code,
+                    "provider_detail": self._error_detail(response)[:500],
+                },
             )
             raise ProviderInvalidRequestError(
                 "Ollama rejected the request.",

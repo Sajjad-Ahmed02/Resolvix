@@ -7,6 +7,7 @@ Ingestion is independent of FastAPI routes and of the LLM provider. The CLI
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Literal
 from uuid import UUID
@@ -123,6 +124,7 @@ class KnowledgeIngestor:
     async def sync_all(self, session: Session) -> IngestionReport:
         """Synchronize every FAQ and document, including inactive sources."""
         report = IngestionReport()
+        started = time.perf_counter()
 
         for faq in knowledge.list_faqs(session, active_only=False):
             report.add(await self.sync_faq(session, faq))
@@ -130,6 +132,19 @@ class KnowledgeIngestor:
         for document in knowledge.list_documents(session, active_only=False):
             report.add(await self.sync_document(session, document))
 
+        logger.info(
+            "Knowledge synchronization completed",
+            extra={
+                "event": "knowledge_sync_summary",
+                "operation": "knowledge_ingestion",
+                "embedding_model": self.embedder.model_name,
+                "duration_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                ),
+                **report.summary(),
+            },
+        )
         return report
 
     async def sync_faq(
@@ -137,78 +152,140 @@ class KnowledgeIngestor:
         session: Session,
         faq: FAQ,
     ) -> SourceSyncResult:
+        started = time.perf_counter()
         if not faq.is_active:
-            return self._remove_inactive_faq(session, faq)
+            result = self._remove_inactive_faq(session, faq)
+            self._log_result(result, started)
+            return result
 
         try:
             desired = chunk_faq(faq.question, faq.answer, self.chunker)
             existing = knowledge.list_chunks_for_faq(session, faq.id)
             state = self._compare(existing, desired, faq.updated_at)
             if not self.force and state == "current":
-                return self._result(faq, "skipped", len(existing))
-            if not self.force and state == "version_only":
+                result = self._result(faq, "skipped", len(existing))
+            elif not self.force and state == "version_only":
                 knowledge.mark_chunks_current(
                     session,
                     existing,
                     source_updated_at=faq.updated_at,
                 )
                 session.commit()
-                return self._result(faq, "refreshed", len(existing))
-
-            embeddings = await self._embed_chunks(desired)
-            knowledge.replace_faq_chunks(
-                session,
-                faq.id,
-                contents=[chunk.content for chunk in desired],
-                embeddings=embeddings,
-                embedding_model=self.embedder.model_name,
-                source_updated_at=faq.updated_at,
-            )
-            session.commit()
-            return self._result(faq, "indexed", len(desired))
+                result = self._result(faq, "refreshed", len(existing))
+            else:
+                embeddings = await self._embed_chunks(desired)
+                knowledge.replace_faq_chunks(
+                    session,
+                    faq.id,
+                    contents=[chunk.content for chunk in desired],
+                    embeddings=embeddings,
+                    embedding_model=self.embedder.model_name,
+                    source_updated_at=faq.updated_at,
+                )
+                session.commit()
+                result = self._result(faq, "indexed", len(desired))
         except Exception as error:
             session.rollback()
-            logger.exception("FAQ %s re-index failed", faq.id)
-            return self._failed(faq, error)
+            logger.exception(
+                "FAQ re-index failed",
+                extra={
+                    "event": "knowledge_sync_error",
+                    "operation": "knowledge_ingestion",
+                    "source_type": "faq",
+                    "source_id": str(faq.id),
+                    "embedding_model": self.embedder.model_name,
+                    "error_type": type(error).__name__,
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
+            )
+            result = self._failed(faq, error)
+
+        self._log_result(result, started)
+        return result
 
     async def sync_document(
         self,
         session: Session,
         document: KnowledgeDocument,
     ) -> SourceSyncResult:
+        started = time.perf_counter()
         if not document.is_active:
-            return self._remove_inactive_document(session, document)
+            result = self._remove_inactive_document(session, document)
+            self._log_result(result, started)
+            return result
 
         try:
             desired = self.chunker.split(document.content)
             existing = knowledge.list_chunks_for_document(session, document.id)
             state = self._compare(existing, desired, document.updated_at)
             if not self.force and state == "current":
-                return self._result(document, "skipped", len(existing))
-            if not self.force and state == "version_only":
+                result = self._result(document, "skipped", len(existing))
+            elif not self.force and state == "version_only":
                 knowledge.mark_chunks_current(
                     session,
                     existing,
                     source_updated_at=document.updated_at,
                 )
                 session.commit()
-                return self._result(document, "refreshed", len(existing))
-
-            embeddings = await self._embed_chunks(desired)
-            knowledge.replace_document_chunks(
-                session,
-                document.id,
-                contents=[chunk.content for chunk in desired],
-                embeddings=embeddings,
-                embedding_model=self.embedder.model_name,
-                source_updated_at=document.updated_at,
-            )
-            session.commit()
-            return self._result(document, "indexed", len(desired))
+                result = self._result(document, "refreshed", len(existing))
+            else:
+                embeddings = await self._embed_chunks(desired)
+                knowledge.replace_document_chunks(
+                    session,
+                    document.id,
+                    contents=[chunk.content for chunk in desired],
+                    embeddings=embeddings,
+                    embedding_model=self.embedder.model_name,
+                    source_updated_at=document.updated_at,
+                )
+                session.commit()
+                result = self._result(document, "indexed", len(desired))
         except Exception as error:
             session.rollback()
-            logger.exception("Document %s re-index failed", document.id)
-            return self._failed(document, error)
+            logger.exception(
+                "Document re-index failed",
+                extra={
+                    "event": "knowledge_sync_error",
+                    "operation": "knowledge_ingestion",
+                    "source_type": "document",
+                    "source_id": str(document.id),
+                    "embedding_model": self.embedder.model_name,
+                    "error_type": type(error).__name__,
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
+            )
+            result = self._failed(document, error)
+
+        self._log_result(result, started)
+        return result
+
+    def _log_result(
+        self,
+        result: SourceSyncResult,
+        started: float,
+    ) -> None:
+        logger.info(
+            "Knowledge source synchronized",
+            extra={
+                "event": "knowledge_sync",
+                "operation": "knowledge_ingestion",
+                "source_type": result.source_type,
+                "source_id": str(result.source_id),
+                "action": result.action,
+                "chunks": result.chunks,
+                "embedding_model": self.embedder.model_name,
+                "duration_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                ),
+            },
+        )
 
     def _compare(
         self,
@@ -263,7 +340,16 @@ class KnowledgeIngestor:
             session.commit()
         except Exception as error:
             session.rollback()
-            logger.exception("Could not remove chunks for inactive FAQ %s", faq.id)
+            logger.exception(
+                "Could not remove chunks for inactive FAQ",
+                extra={
+                    "event": "knowledge_sync_error",
+                    "operation": "knowledge_ingestion",
+                    "source_type": "faq",
+                    "source_id": str(faq.id),
+                    "error_type": type(error).__name__,
+                },
+            )
             return self._failed(faq, error)
         action: SourceAction = "deleted" if deleted else "skipped"
         return self._result(faq, action, deleted)
@@ -282,8 +368,14 @@ class KnowledgeIngestor:
         except Exception as error:
             session.rollback()
             logger.exception(
-                "Could not remove chunks for inactive document %s",
-                document.id,
+                "Could not remove chunks for inactive document",
+                extra={
+                    "event": "knowledge_sync_error",
+                    "operation": "knowledge_ingestion",
+                    "source_type": "document",
+                    "source_id": str(document.id),
+                    "error_type": type(error).__name__,
+                },
             )
             return self._failed(document, error)
         action: SourceAction = "deleted" if deleted else "skipped"

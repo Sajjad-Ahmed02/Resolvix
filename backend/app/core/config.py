@@ -20,9 +20,15 @@ class Settings(BaseSettings):
     # ==========================================
 
     APP_NAME: str = "Resolvix"
-    APP_VERSION: str = "0.2.0"
+    APP_VERSION: str = "0.3.0"
     APP_ENV: str = "development"
     DEBUG: bool = True
+
+    # Structured logs include a request id and, for agent turns, an operation
+    # id. ``json`` is the production-friendly default; ``text`` keeps local
+    # terminals readable.
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    LOG_FORMAT: Literal["json", "text"] = "json"
 
     # ==========================================
     # DATABASE CONFIGURATION

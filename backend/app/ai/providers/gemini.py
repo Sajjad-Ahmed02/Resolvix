@@ -126,7 +126,16 @@ class GeminiProvider(LLMProvider):
         except ProviderError:
             raise
         except Exception as error:  # pragma: no cover - defensive boundary
-            logger.exception("Unexpected Gemini provider failure")
+            logger.exception(
+                "Unexpected Gemini provider failure",
+                extra={
+                    "event": "provider_error",
+                    "operation": "llm_invocation",
+                    "provider": self.name,
+                    "model": self.model,
+                    "error_type": type(error).__name__,
+                },
+            )
             raise ProviderUnavailableError(
                 "Gemini could not complete the request.",
                 provider=self.name,
@@ -207,10 +216,18 @@ class GeminiProvider(LLMProvider):
         status = str(getattr(error, "status", "") or "").upper()
         detail = getattr(error, "message", None) or str(error)
         logger.warning(
-            "Gemini API error (code=%s status=%s): %s",
-            code,
-            status or "unknown",
-            detail[:500],
+            "Gemini API error",
+            extra={
+                "event": "provider_api_error",
+                "operation": "llm_invocation",
+                "provider": self.name,
+                "model": self.model,
+                "http_status": code,
+                "provider_status": status or "unknown",
+                # Vendor messages can contain request details, so only a
+                # bounded preview is retained server-side.
+                "provider_detail": detail[:500],
+            },
         )
 
         if code == 429 or status == "RESOURCE_EXHAUSTED":

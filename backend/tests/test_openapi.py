@@ -48,7 +48,7 @@ def test_openapi_documents_all_endpoints_and_auth_schemes(
 
     assert EXPECTED_PATHS <= set(spec["paths"])
     assert spec["info"]["title"] == "Resolvix"
-    assert spec["info"]["version"] == "0.2.0"
+    assert spec["info"]["version"] == "0.3.0"
 
     security_schemes = spec["components"]["securitySchemes"]
     assert security_schemes["Bearer JWT"]["type"] == "http"

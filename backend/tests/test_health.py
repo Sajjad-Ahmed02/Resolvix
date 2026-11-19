@@ -19,7 +19,7 @@ def test_health_checks_database(client: TestClient) -> None:
     assert response.json() == {
         "status": "healthy",
         "application": "Resolvix",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "database": "ok",
     }
 
@@ -55,7 +55,9 @@ def test_unhandled_errors_are_sanitized(monkeypatch) -> None:
         response = test_client.get("/health")
 
     assert response.status_code == 500
-    assert response.json() == {"detail": "An unexpected error occurred."}
+    body = response.json()
+    assert body["detail"] == "An unexpected error occurred."
+    assert body["request_id"] == response.headers["X-Request-ID"]
     assert "RuntimeError" not in response.text
     assert "super-secret" not in response.text
     assert "Traceback" not in response.text

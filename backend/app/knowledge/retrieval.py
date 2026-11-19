@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -10,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.knowledge.embeddings import Embedder
 from app.repositories import knowledge
+
+logger = logging.getLogger(__name__)
 
 SourceType = Literal["faq", "document"]
 
@@ -69,17 +73,43 @@ class KnowledgeRetriever:
     ) -> list[RetrievedChunk]:
         normalized = query.strip()
         if not normalized:
+            logger.info(
+                "Knowledge retrieval skipped for a blank query",
+                extra={
+                    "event": "retrieval_skipped",
+                    "operation": "knowledge_retrieval",
+                    "result_count": 0,
+                },
+            )
             return []
 
         limit = top_k or self.top_k
-        embedding = await self.embedder.embed_query(normalized)
-        rows = knowledge.search_chunks(
-            session,
-            embedding,
-            limit=limit,
-            max_distance=self.max_distance,
-            embedding_model=self.embedder.model_name,
-        )
+        started = time.perf_counter()
+        try:
+            embedding = await self.embedder.embed_query(normalized)
+            rows = knowledge.search_chunks(
+                session,
+                embedding,
+                limit=limit,
+                max_distance=self.max_distance,
+                embedding_model=self.embedder.model_name,
+            )
+        except Exception as error:
+            logger.exception(
+                "Knowledge retrieval failed",
+                extra={
+                    "event": "retrieval_error",
+                    "operation": "knowledge_retrieval",
+                    "top_k": limit,
+                    "embedding_model": self.embedder.model_name,
+                    "error_type": type(error).__name__,
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000,
+                        2,
+                    ),
+                },
+            )
+            raise
 
         results: list[RetrievedChunk] = []
         for chunk, faq, document, distance in rows:
@@ -107,4 +137,20 @@ class KnowledgeRetriever:
                         distance=distance,
                     )
                 )
+
+        logger.info(
+            "Knowledge retrieval completed",
+            extra={
+                "event": "retrieval_completed",
+                "operation": "knowledge_retrieval",
+                "top_k": limit,
+                "result_count": len(results),
+                "query_chars": len(normalized),
+                "embedding_model": self.embedder.model_name,
+                "duration_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                ),
+            },
+        )
         return results

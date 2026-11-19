@@ -274,6 +274,15 @@ async def add_customer_message(
         with_messages=False,
     )
     if conversation is None:
+        logger.warning(
+            "Conversation access denied",
+            extra={
+                "event": "conversation_access_denied",
+                "operation": "conversation_message",
+                "conversation_id": str(conversation_id),
+                "user_id": str(user_id),
+            },
+        )
         return None
 
     previous_messages = messages.list_recent_for_conversation(
@@ -365,4 +374,18 @@ async def add_customer_message(
     session.refresh(conversation)
     session.refresh(user_message)
     session.refresh(assistant_message)
+    logger.info(
+        "Assistant reply persisted",
+        extra={
+            "event": "conversation_reply_persisted",
+            "operation": "conversation_message",
+            "conversation_id": str(conversation.id),
+            "message_id": str(assistant_message.id),
+            "source": result.source,
+            "grounded": result.grounded,
+            "fallback": result.fallback,
+            "tool_calls": len(result.tool_executions),
+            "error_code": result.error,
+        },
+    )
     return conversation, user_message, assistant_message
